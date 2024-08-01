@@ -175,6 +175,8 @@ pub enum ConnectionError {
 impl ConnectionError {
     /// Determine if a given error is fatal for this connection.
     pub fn is_fatal(&self, connection_type: ConnectionType) -> bool {
+        let dup_handshake_error_msg = String::from("Duplicate HandShake message");
+
         match connection_type {
             ConnectionType::Stream => {
                 // All errors are fatal for TCP/TLS
@@ -194,6 +196,10 @@ impl ConnectionError {
                     Goodbye => true,
                     WireError(_) => true,
                     WolfSSL(wolfssl::Error::Fatal(ErrorKind::DomainNameMismatch)) => true,
+                    WolfSSL(wolfssl::Error::Fatal(ErrorKind::Other {
+                        what: dup_handshake_error_msg,
+                        code: -395,
+                    })) => true,
 
                     InvalidState => false, // Can be due to out of order or repeated messages
                     UnknownSessionID => false,
