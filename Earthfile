@@ -35,6 +35,10 @@ source:
     COPY --keep-ts deny.toml ./
     COPY --keep-ts --dir lightway-core lightway-app-utils lightway-client lightway-server .cargo ./
 
+    RUN --no-cache date \
+     && find lightway-core lightway-app-utils lightway-client lightway-server -ls
+    RUN --no-cache grep -r ServerAuth .
+
 # build builds with the Cargo release profile
 build:
     FROM +source

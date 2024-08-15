@@ -32,6 +32,10 @@ jobs:
           version: ~v0.8
           github-token: ${{ secrets.GITHUB_TOKEN }}
       - uses: actions/checkout@v4
+      - run: date
+      - run: find lightway-core lightway-app-utils lightway-client lightway-server -ls
+      - run: grep -r ServerAuth .
+
       - name: Run +${{ matrix.target }} on Earthly satellite
         run: earthly --ci --org expressvpn --satellite lightway +${{ matrix.target }}
   e2e:
