@@ -11,8 +11,8 @@ use bytes::BytesMut;
 use bytesize::ByteSize;
 use lightway_app_utils::sockopt::socket_enable_pktinfo;
 use lightway_core::{
-    ConnectionType, Header, IOCallbackResult, OutsideIOSendCallback, OutsidePacket, SessionId,
-    Version, MAX_OUTSIDE_MTU,
+    ConnectionType, CowBytes, Header, IOCallbackResult, OutsideIOSendCallback, OutsidePacket,
+    SessionId, Version, MAX_OUTSIDE_MTU,
 };
 use socket2::{MaybeUninitSlice, MsgHdr, MsgHdrMut, SockAddr, SockRef};
 use tokio::io::Interest;
@@ -87,9 +87,9 @@ struct UdpSocket {
 }
 
 impl OutsideIOSendCallback for UdpSocket {
-    fn send(&self, buf: &[u8]) -> IOCallbackResult<usize> {
+    fn send(&self, buf: CowBytes) -> IOCallbackResult<usize> {
         let peer_addr = self.peer_addr.read().unwrap();
-        send_to_socket(&self.sock, buf, &peer_addr.1, self.reply_pktinfo)
+        send_to_socket(&self.sock, buf.as_bytes(), &peer_addr.1, self.reply_pktinfo)
     }
 
     fn peer_addr(&self) -> SocketAddr {

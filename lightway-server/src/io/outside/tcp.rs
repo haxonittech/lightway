@@ -4,7 +4,7 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use bytes::BytesMut;
 use lightway_core::{
-    ConnectionType, IOCallbackResult, OutsideIOSendCallback, OutsidePacket, Version,
+    ConnectionType, CowBytes, IOCallbackResult, OutsideIOSendCallback, OutsidePacket, Version,
     MAX_OUTSIDE_MTU,
 };
 use socket2::SockRef;
@@ -21,8 +21,8 @@ struct TcpStream {
 }
 
 impl OutsideIOSendCallback for TcpStream {
-    fn send(&self, buf: &[u8]) -> IOCallbackResult<usize> {
-        match self.sock.try_write(buf) {
+    fn send(&self, buf: CowBytes) -> IOCallbackResult<usize> {
+        match self.sock.try_write(buf.as_bytes()) {
             Ok(nr) => IOCallbackResult::Ok(nr),
             Err(err) if matches!(err.kind(), std::io::ErrorKind::WouldBlock) => {
                 IOCallbackResult::WouldBlock
