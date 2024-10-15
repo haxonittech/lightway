@@ -1330,6 +1330,7 @@ dependencies = [
  "ctrlc",
  "delegate",
  "educe",
+ "io-uring",
  "ipnet",
  "jsonwebtoken",
  "libc",
@@ -1354,6 +1355,7 @@ dependencies = [
  "tracing",
  "tracing-log",
  "tracing-subscriber",
+ "tun",
  "twelf",
 ]
 
