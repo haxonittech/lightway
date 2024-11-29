@@ -99,10 +99,8 @@ async fn main() -> Result<()> {
     }
 
     #[cfg(feature = "debug")]
-    if config.tls_debug {
-        enable_tls_debug();
-    }
-
+    enable_tls_debug();
+    
     let fmt = tracing_subscriber::fmt().with_max_level(config.log_level);
 
     config.log_format.init(fmt);
