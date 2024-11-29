@@ -145,6 +145,8 @@ pub struct ServerConfig<SA: for<'a> ServerAuth<AuthState<'a>>> {
 pub async fn server<SA: for<'a> ServerAuth<AuthState<'a>> + Sync + Send + 'static>(
     config: ServerConfig<SA>,
 ) -> Result<()> {
+    #[cfg(feature = "debug")]
+    lightway_core::enable_tls_debug();
     let server_key = Secret::PemFile(&config.server_key);
     let server_cert = Secret::PemFile(&config.server_cert);
 
