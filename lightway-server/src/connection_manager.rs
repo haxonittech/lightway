@@ -1,7 +1,7 @@
 mod connection_map;
 
-use dashmap::DashMap;
 use delegate::delegate;
+use hashbrown::HashMap;
 use parking_lot::Mutex;
 use std::{
     net::SocketAddr,
@@ -104,7 +104,7 @@ async fn evict_expired_connections(manager: Weak<ConnectionManager>) {
 pub(crate) struct ConnectionManager {
     ctx: ServerContext<ConnectionState>,
     connections: Mutex<ConnectionMap<Connection>>,
-    pending_session_id_rotations: DashMap<SessionId, Arc<Connection>>,
+    pending_session_id_rotations: Mutex<HashMap<SessionId, Arc<Connection>>>,
     /// Total number of sessions there have ever been
     total_sessions: AtomicUsize,
 }
@@ -215,7 +215,7 @@ impl ConnectionManager {
         let conn_manager = Arc::new(Self {
             ctx,
             connections: Mutex::new(Default::default()),
-            pending_session_id_rotations: Default::default(),
+            pending_session_id_rotations: Mutex::new(Default::default()),
             total_sessions: Default::default(),
         });
 
@@ -237,7 +237,7 @@ impl ConnectionManager {
     }
 
     pub(crate) fn pending_session_id_rotations_count(&self) -> usize {
-        self.pending_session_id_rotations.len()
+        self.pending_session_id_rotations.lock().len()
     }
 
     pub(crate) fn create_streaming_connection(
@@ -313,7 +313,7 @@ impl ConnectionManager {
             }
             connection_map::Entry::Vacant(_e) => {
                 // Maybe this is a pending session rotation
-                if let Some(c) = self.pending_session_id_rotations.get(&session_id) {
+                if let Some(c) = self.pending_session_id_rotations.lock().get(&session_id) {
                     let update_peer_address = addr != c.peer_addr();
 
                     return Ok((c.clone(), update_peer_address));
@@ -349,6 +349,7 @@ impl ConnectionManager {
         new_session_id: SessionId,
     ) {
         self.pending_session_id_rotations
+            .lock()
             .insert(new_session_id, conn.clone());
 
         metrics::udp_session_rotation_begin();
@@ -360,7 +361,7 @@ impl ConnectionManager {
         old: SessionId,
         new: SessionId,
     ) {
-        self.pending_session_id_rotations.remove(&new);
+        self.pending_session_id_rotations.lock().remove(&new);
         self.connections
             .lock()
             .update_session_id_for_connection(old, new);
