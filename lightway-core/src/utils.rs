@@ -25,7 +25,6 @@ use tracing::warn;
 //     }
 // }
 
-//!
 // HOT/COLD path implementation until RUST adds
 // https://github.com/rust-lang/rust/issues/26179
 
@@ -391,8 +390,9 @@ mod tests {
     ];
 
     #[test_case(&[] => false; "empty")]
-    #[test_case(&[0x40] => true; "v4")]
-    #[test_case(&[0x60] => false; "v6")]
+    #[test_case(&[0x40; 19] => false; "buffer too small")]
+    #[test_case(&[0x45; 20] => true; "minimum valid v4")]
+    #[test_case(&[0x60; 20] => false; "v6 header")]
     #[test_case(SOURCE_1_DEST_1 => true; "SOURCE_1_TO_DEST_1")]
     #[test_case(SOURCE_1_DEST_2 => true; "SOURCE_1_TO_DEST_2")]
     #[test_case(SOURCE_2_DEST_1 => true; "SOURCE_2_TO_DEST_1")]
