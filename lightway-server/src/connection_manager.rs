@@ -1,11 +1,12 @@
 mod connection_map;
 
+use dashmap::DashMap;
 use delegate::delegate;
+use parking_lot::Mutex;
 use std::{
-    collections::HashMap,
     net::SocketAddr,
     sync::{
-        Arc, Mutex, Weak,
+        Arc, Weak,
         atomic::{AtomicUsize, Ordering},
     },
 };
@@ -107,7 +108,7 @@ async fn evict_expired_connections(manager: Weak<ConnectionManager>) {
 pub(crate) struct ConnectionManager {
     ctx: ServerContext<ConnectionState>,
     connections: Mutex<ConnectionMap<Connection>>,
-    pending_session_id_rotations: Mutex<HashMap<SessionId, Arc<Connection>>>,
+    pending_session_id_rotations: DashMap<SessionId, Arc<Connection>>,
     /// Total number of sessions there have ever been
     total_sessions: AtomicUsize,
 }
@@ -230,7 +231,7 @@ impl ConnectionManager {
         let conn_manager = Arc::new(Self {
             ctx,
             connections: Mutex::new(Default::default()),
-            pending_session_id_rotations: Mutex::new(Default::default()),
+            pending_session_id_rotations: Default::default(),
             total_sessions: Default::default(),
         });
 
@@ -252,7 +253,7 @@ impl ConnectionManager {
     }
 
     pub(crate) fn pending_session_id_rotations_count(&self) -> usize {
-        self.pending_session_id_rotations.lock().unwrap().len()
+        self.pending_session_id_rotations.len()
     }
 
     pub(crate) fn create_streaming_connection(
@@ -269,7 +270,7 @@ impl ConnectionManager {
             outside_io,
         )?;
         // TODO: what if addr was already present?
-        self.connections.lock().unwrap().insert(&conn)?;
+        self.connections.lock().insert(&conn)?;
         Ok(conn)
     }
 
@@ -302,7 +303,7 @@ impl ConnectionManager {
     where
         F: FnOnce() -> OutsideIOSendCallbackArg,
     {
-        match self.connections.lock().unwrap().lookup(addr, session_id) {
+        match self.connections.lock().lookup(addr, session_id) {
             connection_map::Entry::Occupied(c) => {
                 if session_id == SessionId::EMPTY || c.session_id() == session_id {
                     let update_peer_address = addr != c.peer_addr();
@@ -330,8 +331,6 @@ impl ConnectionManager {
                 // Maybe this is a pending session rotation
                 if let Some(c) = self
                     .pending_session_id_rotations
-                    .lock()
-                    .unwrap()
                     .get(&session_id)
                 {
                     let update_peer_address = addr != c.peer_addr();
@@ -349,19 +348,18 @@ impl ConnectionManager {
         self: &Arc<Self>,
         addr: SocketAddr,
     ) -> Option<Arc<Connection>> {
-        self.connections.lock().unwrap().find_by(addr)
+        self.connections.lock().find_by(addr)
     }
 
     pub(crate) fn set_peer_addr(&self, conn: &Arc<Connection>, new_addr: SocketAddr) {
         let old_addr = conn.set_peer_addr(new_addr);
         self.connections
             .lock()
-            .unwrap()
             .update_socketaddr_for_connection(old_addr, new_addr);
     }
 
     pub(crate) fn remove_connection(&self, conn: &Connection) {
-        self.connections.lock().unwrap().remove(conn)
+        self.connections.lock().remove(conn)
     }
 
     pub(crate) fn begin_session_id_rotation(
@@ -370,8 +368,6 @@ impl ConnectionManager {
         new_session_id: SessionId,
     ) {
         self.pending_session_id_rotations
-            .lock()
-            .unwrap()
             .insert(new_session_id, conn.clone());
 
         metrics::udp_session_rotation_begin();
@@ -384,12 +380,9 @@ impl ConnectionManager {
         new: SessionId,
     ) {
         self.pending_session_id_rotations
-            .lock()
-            .unwrap()
             .remove(&new);
         self.connections
             .lock()
-            .unwrap()
             .update_session_id_for_connection(old, new);
 
         metrics::udp_session_rotation_finalized();
@@ -398,7 +391,6 @@ impl ConnectionManager {
     pub(crate) fn online_connection_activity(&self) -> Vec<ConnectionActivity> {
         self.connections
             .lock()
-            .unwrap()
             .iter_connections()
             .filter_map(|c| match c.state() {
                 State::Online => Some(c.activity()),
@@ -411,7 +403,7 @@ impl ConnectionManager {
     fn evict_idle_connections(&self) {
         tracing::trace!("Aging connections");
 
-        for conn in self.connections.lock().unwrap().iter_connections() {
+        for conn in self.connections.lock().iter_connections() {
             let age = conn.activity().last_outside_data_received.elapsed();
             if age > CONNECTION_MAX_IDLE_AGE {
                 tracing::info!(session = ?conn.session_id(), age = ?age, "Disconnecting idle connection");
@@ -431,7 +423,7 @@ impl ConnectionManager {
     fn evict_expired_connections(&self) {
         tracing::trace!("Expiring connections");
 
-        for conn in self.connections.lock().unwrap().iter_connections() {
+        for conn in self.connections.lock().iter_connections() {
             let Ok(expired) = conn.authentication_expired() else {
                 continue;
             };
@@ -449,7 +441,7 @@ impl ConnectionManager {
     }
 
     pub(crate) fn close_all_connections(&self) {
-        let connections = self.connections.lock().unwrap().remove_connections();
+        let connections = self.connections.lock().remove_connections();
         for conn in connections {
             let _ = conn.lw_disconnect();
         }
