@@ -24,10 +24,9 @@ bytes.workspace = true
 bytesize.workspace = true
 clap.workspace = true
 ctrlc.workspace = true
-dashmap = "6.1.0"
 delegate.workspace = true
 educe.workspace = true
-hashbrown = "=0.14.5"  # Force older version for dashmap compatibility
+hashbrown = "0.15.2"
 ipnet.workspace = true
 jsonwebtoken = "9.3.0"
 libc.workspace = true
