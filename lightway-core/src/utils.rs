@@ -25,10 +25,9 @@ use tracing::warn;
 //     }
 // }
 
-/**
- * HOT/COLD path implementation until RUST adds
- * https://github.com/rust-lang/rust/issues/26179
- */
+//!
+// HOT/COLD path implementation until RUST adds
+// https://github.com/rust-lang/rust/issues/26179
 
 #[inline]
 #[cold]
@@ -36,13 +35,17 @@ fn cold() {}
 
 #[inline]
 pub(crate) fn likely(b: bool) -> bool {
-    if !b { cold() }
+    if !b {
+        cold()
+    }
     b
 }
 
 #[inline]
 pub(crate) fn unlikely(b: bool) -> bool {
-    if b { cold() }
+    if b {
+        cold()
+    }
     b
 }
 
@@ -201,7 +204,7 @@ fn update_transport_checksums(packet: &mut MutableIpv4Packet, updates: ChecksumU
             if unlikely(true) {
                 warn!(protocol = ?protocol, "Unknown protocol, skipping checksum update");
             }
-        },
+        }
     }
 }
 

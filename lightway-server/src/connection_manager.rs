@@ -313,10 +313,7 @@ impl ConnectionManager {
             }
             connection_map::Entry::Vacant(_e) => {
                 // Maybe this is a pending session rotation
-                if let Some(c) = self
-                    .pending_session_id_rotations
-                    .get(&session_id)
-                {
+                if let Some(c) = self.pending_session_id_rotations.get(&session_id) {
                     let update_peer_address = addr != c.peer_addr();
 
                     return Ok((c.clone(), update_peer_address));
@@ -363,8 +360,7 @@ impl ConnectionManager {
         old: SessionId,
         new: SessionId,
     ) {
-        self.pending_session_id_rotations
-            .remove(&new);
+        self.pending_session_id_rotations.remove(&new);
         self.connections
             .lock()
             .update_session_id_for_connection(old, new);
