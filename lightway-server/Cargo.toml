@@ -27,6 +27,7 @@ ctrlc.workspace = true
 dashmap = "6.1.0"
 delegate.workspace = true
 educe.workspace = true
+hashbrown = "=0.14.5"  # Force older version for dashmap compatibility
 ipnet.workspace = true
 jsonwebtoken = "9.3.0"
 libc.workspace = true
