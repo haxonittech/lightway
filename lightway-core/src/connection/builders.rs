@@ -278,7 +278,7 @@ impl<'a, AppState: Send + 'static> ServerConnectionBuilder<'a, AppState> {
         let auth = ctx.auth.clone();
         let ip_pool = ctx.ip_pool.clone();
 
-        let session_id = ctx.rng.lock().unwrap().gen();
+        let session_id = ctx.rng.lock().gen();
 
         let outside_mtu = MAX_OUTSIDE_MTU;
 
