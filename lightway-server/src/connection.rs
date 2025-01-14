@@ -84,6 +84,7 @@ impl Connection {
             .app_state_mut()
             .conn
             .set(Arc::downgrade(&conn))
+            .unwrap();
 
         let mut join_set = tokio::task::JoinSet::new();
         ticker_task.spawn(Arc::downgrade(&conn), &mut join_set);
