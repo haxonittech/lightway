@@ -1,6 +1,6 @@
+use lightway_raptor::LightwayDataFrame;
 use rand::seq::SliceRandom;
 use raptorq::{Decoder, Encoder, EncodingPacket};
-use lightway_raptor::LightwayDataFrame;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create a LightwayDataFrame and add packets.

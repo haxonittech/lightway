@@ -1,12 +1,12 @@
+use crate::LightwayDataFrame;
 use anyhow::Result;
-use raptorq::{Encoder, Decoder, EncodingPacket, ObjectTransmissionInformation};
-use crate::LightwayDataFrame; // Replace `some_module` with the actual module name where LightwayDataFrame is defined.
+use raptorq::{Decoder, Encoder, EncodingPacket, ObjectTransmissionInformation}; // Replace `some_module` with the actual module name where LightwayDataFrame is defined.
 
+use std::collections::HashMap;
 use tokio::{
     net::UdpSocket,
-    time::{Instant, Duration},
+    time::{Duration, Instant},
 };
-use std::collections::HashMap;
 
 #[derive(Debug)]
 struct DecoderState {
@@ -58,32 +58,32 @@ impl Raptor {
             let mut pkt = vec![0u8; 1500]; // Max UDP packet size
 
             tokio::select! {
-            result = self.socket.recv_from(&mut pkt) => {
-                let (len, _addr) = result?;
-                pkt.truncate(len);
+                result = self.socket.recv_from(&mut pkt) => {
+                    let (len, _addr) = result?;
+                    pkt.truncate(len);
 
-                // Add the received data to the outgoing aggregator
-                self.outgoing_frame.add_packet(pkt);
+                    // Add the received data to the outgoing aggregator
+                    self.outgoing_frame.add_packet(pkt);
 
-                // If size limit is reached, flush the aggregator
-                if self.outgoing_frame.len() >= self.x_kb_limit {
-                    self.flush().await?;
-                    deadline = Instant::now() + Duration::from_millis(self.y_ms_timeout);
-                } else {
-                    // Reset the deadline as we received data
+                    // If size limit is reached, flush the aggregator
+                    if self.outgoing_frame.len() >= self.x_kb_limit {
+                        self.flush().await?;
+                        deadline = Instant::now() + Duration::from_millis(self.y_ms_timeout);
+                    } else {
+                        // Reset the deadline as we received data
+                        deadline = Instant::now() + Duration::from_millis(self.y_ms_timeout);
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                        println!("[Raptor] Timeout reached!");
+                    // Timeout occurred, check if there is data to flush
+                    if !self.outgoing_frame.is_empty() {
+                        self.flush().await?;
+                    }
+                    // Reset the deadline for the next timeout
                     deadline = Instant::now() + Duration::from_millis(self.y_ms_timeout);
                 }
             }
-            _ = tokio::time::sleep_until(deadline) => {
-                    println!("[Raptor] Timeout reached!");
-                // Timeout occurred, check if there is data to flush
-                if !self.outgoing_frame.is_empty() {
-                    self.flush().await?;
-                }
-                // Reset the deadline for the next timeout
-                deadline = Instant::now() + Duration::from_millis(self.y_ms_timeout);
-            }
-        }
         }
     }
     /// Create a new Raptor instance.
@@ -136,7 +136,6 @@ impl Raptor {
         let serialized_data = self.outgoing_frame.serialize()?;
         // Create RaptorQ encoder
         //let encoder = Encoder::with_defaults(&serialized_data, self.outgoing_frame.largest_packet_length() as u16);
-
 
         // Determine the maximum symbol size, using the smaller of mtu (if set) and largest_packet_length
         let max_symbol_size = match self.mtu {
@@ -215,11 +214,14 @@ impl Raptor {
         let oti = ObjectTransmissionInformation::deserialize(oti_data.try_into()?);
 
         // Get or create a DecoderState
-        let entry = self.decoders.entry(frame_id).or_insert_with(|| DecoderState {
-            decoder: Decoder::new(oti),
-            last_updated: Instant::now(),
-            completed: false,
-        });
+        let entry = self
+            .decoders
+            .entry(frame_id)
+            .or_insert_with(|| DecoderState {
+                decoder: Decoder::new(oti),
+                last_updated: Instant::now(),
+                completed: false,
+            });
 
         if entry.completed {
             // Already done? Possibly a duplicate
@@ -242,7 +244,11 @@ impl Raptor {
             match LightwayDataFrame::deserialize(&decoded_bytes) {
                 Ok(lw_frame) => {
                     // Extract all original packets
-                    let packets = lw_frame.get_all_packets().into_iter().map(|p| p.to_vec()).collect();
+                    let packets = lw_frame
+                        .get_all_packets()
+                        .into_iter()
+                        .map(|p| p.to_vec())
+                        .collect();
                     // Optionally remove from the map
                     // self.decoders.remove(&frame_id);
                     return Ok(Some(packets));

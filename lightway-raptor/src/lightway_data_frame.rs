@@ -4,7 +4,7 @@ use std::io::{self, Read};
 #[derive(Debug)]
 pub struct LightwayDataFrame {
     packets: Vec<Vec<u8>>, // A vector of packets, where each packet is a Vec<u8>
-    number: u16, // The frane counter
+    number: u16,           // The frane counter
 }
 
 #[derive(Debug)]
@@ -15,7 +15,10 @@ pub struct LightwayRaptorFrame {
 
 impl LightwayRaptorFrame {
     pub fn new(number: u16, encoder_config: [u8; 12]) -> Self {
-        Self{number, encoder_config}
+        Self {
+            number,
+            encoder_config,
+        }
     }
 
     pub fn number(&self) -> u16 {
@@ -30,11 +33,14 @@ impl LightwayRaptorFrame {
 impl LightwayDataFrame {
     /// Creates a new, empty `LightwayDataFrame`.
     pub fn new(packets: Vec<Vec<u8>>) -> Self {
-        Self { packets , number: 0 }
+        Self { packets, number: 0 }
     }
 
     pub fn new_empty() -> Self {
-        Self { packets: vec![], number: 0 }
+        Self {
+            packets: vec![],
+            number: 0,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -84,7 +90,10 @@ impl LightwayDataFrame {
 
     /// Retrieves all packets as slices.
     pub fn get_all_packets(&self) -> Vec<&[u8]> {
-        self.packets.iter().map(|packet| packet.as_slice()).collect()
+        self.packets
+            .iter()
+            .map(|packet| packet.as_slice())
+            .collect()
     }
 
     /// Serializes the `LightwayDataFrame` into a contiguous byte vector.
@@ -163,8 +172,8 @@ mod tests {
         frame.add_packet(vec![4, 5, 6, 7]);
 
         let serialized = frame.serialize().expect("Serialization failed");
-        let deserialized_frame = LightwayDataFrame::deserialize(&serialized)
-            .expect("Deserialization failed");
+        let deserialized_frame =
+            LightwayDataFrame::deserialize(&serialized).expect("Deserialization failed");
 
         assert_eq!(deserialized_frame.packets.len(), 2);
         assert_eq!(deserialized_frame.packets[0], vec![1, 2, 3]);
@@ -204,8 +213,8 @@ mod tests {
     fn test_empty_serialization() {
         let frame = LightwayDataFrame::new(Vec::new());
         let serialized = frame.serialize().expect("Serialization failed");
-        let deserialized_frame = LightwayDataFrame::deserialize(&serialized)
-            .expect("Deserialization failed");
+        let deserialized_frame =
+            LightwayDataFrame::deserialize(&serialized).expect("Deserialization failed");
 
         assert!(deserialized_frame.packets.is_empty());
     }
