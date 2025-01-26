@@ -1,63 +1,110 @@
-use anyhow::{Context, Result, anyhow};
-use bytes::{BufMut, Bytes, BytesMut};
-use lightway_core::IOCallbackResult;
-use thiserror::Error;
-
 use crate::metrics;
-use io_uring::{
-    Builder, IoUring, SubmissionQueue, Submitter, cqueue::Entry as CEntry, opcode,
-    squeue::Entry as SEntry, types::Fixed,
-};
+use anyhow::Result;
+use bytes::BytesMut;
+use io_uring::{opcode, types, IoUring};
+use libc::iovec;
+use lightway_core::IOCallbackResult;
+use parking_lot::Mutex;
 use std::{
-    os::fd::{AsRawFd, RawFd},
-    sync::Arc,
+    cell::UnsafeCell,
+    os::unix::io::{AsRawFd, RawFd},
+    sync::{
+        atomic::{AtomicU32, AtomicUsize, Ordering},
+        Arc,
+    },
     thread,
     time::Duration,
 };
-use tokio::{
-    io::AsyncReadExt,
-    sync::{Mutex, mpsc},
-};
-use tokio_eventfd::EventFd;
 
-const REGISTERED_FD_INDEX: u32 = 0;
+const DEFAULT_BUFFER_SIZE: usize = 2048;
+
+#[cfg(not(feature = "iouring-bufsize"))]
+const BUFFER_SIZE: usize = DEFAULT_BUFFER_SIZE;
+
+#[cfg(feature = "iouring-bufsize")]
+const MAX_BUFFER_SIZE: usize = 65536;
+#[cfg(feature = "iouring-bufsize")]
+const BUFFER_SIZE: usize = {
+    let size = std::env!("IOURING_BUFFER_SIZE")
+        .parse::<usize>()
+        .expect("IOURING_BUFFER_SIZE must be a valid usize");
+    assert!(size <= MAX_BUFFER_SIZE, "Buffer size cannot exceed 64KB");
+    size
+};
+
+#[repr(align(128))]
+struct Buffer {
+    data: UnsafeCell<[u8; BUFFER_SIZE]>,
+    state: AtomicU32, // 0 = free, 1 = in_flight, 2 = completed
+    length: AtomicU32,
+}
+
+#[allow(unsafe_code)]
+unsafe impl Send for Buffer {}
+#[allow(unsafe_code)]
+unsafe impl Sync for Buffer {}
+
+impl Buffer {
+    fn new() -> Self {
+        Self {
+            data: UnsafeCell::new([0u8; BUFFER_SIZE]),
+            state: AtomicU32::new(0),
+            length: AtomicU32::new(0),
+        }
+    }
+}
+
+struct BufferPool {
+    buffers: Vec<Buffer>,
+    read_idx: AtomicUsize,
+}
 
 /// IO-uring Struct
 pub struct IOUring<T: AsRawFd> {
-    /// Any struct corresponds to a file descriptor
     owned_fd: Arc<T>,
-
-    tx_queue: mpsc::Sender<Bytes>,
-    rx_queue: Mutex<mpsc::Receiver<BytesMut>>,
+    rx_pool: Arc<BufferPool>,
+    tx_pool: Arc<BufferPool>,
+    ring: Arc<IoUring>,
+    submission_lock: Arc<Mutex<()>>,
+    write_index: AtomicUsize,
 }
 
-/// An error from read/write operation
-#[derive(Debug, Error)]
-pub enum IOUringError {
-    /// A recv error occurred
-    #[error("Recv Error")]
-    RecvError,
-
-    /// A send error occurred
-    #[error("Send Error")]
-    SendError,
-}
-
-pub type IOUringResult<T> = std::result::Result<T, IOUringError>;
-
+#[allow(unsafe_code)]
 impl<T: AsRawFd> IOUring<T> {
     /// Create `IOUring` struct
     pub async fn new(
         owned_fd: Arc<T>,
         ring_size: usize,
-        channel_size: usize,
+        _channel_size: usize,
         mtu: usize,
         sqpoll_idle_time: Duration,
     ) -> Result<Self> {
+        assert!(mtu <= BUFFER_SIZE);
+
+        let rx_pool = Arc::new(BufferPool {
+            buffers: (0..ring_size / 2).map(|_| Buffer::new()).collect(),
+            read_idx: AtomicUsize::new(0),
+        });
+
+        let tx_pool = Arc::new(BufferPool {
+            buffers: (0..ring_size / 2).map(|_| Buffer::new()).collect(),
+            read_idx: AtomicUsize::new(0),
+        });
+
+        let ring = Arc::new(
+            IoUring::builder()
+                .setup_sqpoll(sqpoll_idle_time.as_millis() as u32)
+                .build(ring_size as u32)?,
+        );
+
+        let submission_lock = Arc::new(Mutex::new(()));
+
+        let rx_pool_clone = rx_pool.clone();
+        let tx_pool_clone = tx_pool.clone();
+        let ring_clone = ring.clone();
+        let lock_clone = submission_lock.clone();
         let fd = owned_fd.as_raw_fd();
 
-        let (tx_queue_sender, tx_queue_receiver) = mpsc::channel(channel_size);
-        let (rx_queue_sender, rx_queue_receiver) = mpsc::channel(channel_size);
         thread::Builder::new()
             .name("io_uring-main".to_string())
             .spawn(move || {
@@ -67,21 +114,20 @@ impl<T: AsRawFd> IOUring<T> {
                     .expect("Failed building Tokio Runtime")
                     .block_on(iouring_task(
                         fd,
-                        ring_size,
-                        mtu,
-                        sqpoll_idle_time,
-                        tx_queue_receiver,
-                        rx_queue_sender,
+                        rx_pool_clone,
+                        tx_pool_clone,
+                        ring_clone,
+                        lock_clone,
                     ))
-                    .inspect_err(|err| {
-                        tracing::error!("i/o uring task stopped: {:?}", err);
-                    })
             })?;
 
         Ok(Self {
             owned_fd,
-            tx_queue: tx_queue_sender,
-            rx_queue: Mutex::new(rx_queue_receiver),
+            rx_pool,
+            tx_pool,
+            ring,
+            submission_lock,
+            write_index: AtomicUsize::new(0),
         })
     }
 
@@ -90,375 +136,190 @@ impl<T: AsRawFd> IOUring<T> {
         &self.owned_fd
     }
 
-    /// Receive packet from Tun device
-    pub async fn recv(&self) -> IOUringResult<BytesMut> {
-        self.rx_queue
-            .lock()
-            .await
-            .recv()
-            .await
-            .ok_or(IOUringError::RecvError)
-    }
-
-    /// Try Send packet to Tun device
+    /// Send packet on Tun device (push to RING and submit)
     pub fn try_send(&self, buf: BytesMut) -> IOCallbackResult<usize> {
-        let buf_len = buf.len();
-        let try_send_res = self.tx_queue.try_send(buf.freeze());
-        match try_send_res {
-            Ok(()) => IOCallbackResult::Ok(buf_len),
-            Err(mpsc::error::TrySendError::Full(_)) => IOCallbackResult::WouldBlock,
-            Err(_) => {
-                use std::io::{Error, ErrorKind};
-                IOCallbackResult::Err(Error::new(ErrorKind::Other, IOUringError::SendError))
-            }
+        let len = buf.len();
+        if len > BUFFER_SIZE {
+            return IOCallbackResult::WouldBlock;
         }
-    }
-}
 
-#[derive(Debug)]
-enum SlotIdx {
-    Tx(isize),
-    Rx(isize),
-}
+        let write_idx =
+            self.write_index.fetch_add(1, Ordering::AcqRel) % self.tx_pool.buffers.len();
+        let buffer = &self.tx_pool.buffers[write_idx];
 
-impl SlotIdx {
-    fn from_user_data(u: u64) -> Self {
-        let u = u as isize;
-        if u < 0 { Self::Rx(!u) } else { Self::Tx(u) }
-    }
-
-    fn idx(&self) -> usize {
-        match *self {
-            SlotIdx::Tx(idx) => idx as usize,
-            SlotIdx::Rx(idx) => idx as usize,
+        // Check if buffer is free (state = 0)
+        if buffer
+            .state
+            .compare_exchange(
+                0,
+                1, // free -> in_flight
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            // Out of buffers, need kernel to work faster
+            // consider a bigger queue if we see this counter
+            metrics::tun_iouring_tx_err();
+            return IOCallbackResult::WouldBlock;
         }
-    }
 
-    fn user_data(&self) -> u64 {
-        match *self {
-            SlotIdx::Tx(idx) => idx as u64,
-            SlotIdx::Rx(idx) => (!idx) as u64,
-        }
-    }
-}
+        unsafe { (*buffer.data.get())[..len].copy_from_slice(&buf) };
+        buffer.length.store(len as u32, Ordering::Release);
 
-struct RxState {
-    sender: Option<mpsc::OwnedPermit<BytesMut>>,
-    buf: BytesMut,
-}
-
-fn push_one_tx_event_to(
-    buf: Bytes,
-    sq: &mut SubmissionQueue,
-    bufs: &mut [Option<Bytes>],
-    slot: SlotIdx,
-) -> std::result::Result<(), SlotIdx> {
-    let sqe = opcode::Write::new(Fixed(REGISTERED_FD_INDEX), buf.as_ptr(), buf.len() as _)
+        let write_op = opcode::WriteFixed::new(
+            types::Fd(self.owned_fd.as_raw_fd()),
+            buffer.data.get() as *mut u8,
+            len as _,
+            write_idx as _,
+        )
         .build()
-        .user_data(slot.user_data());
+        // NOTE: we set the index starting from after the RX_POOL part
+        .user_data((self.rx_pool.buffers.len() + write_idx) as u64);
 
-    #[allow(unsafe_code)]
-    // SAFETY: sqe points to a buffer on the heap, owned
-    // by a `Bytes` in `bufs[slot]`, we will not reuse
-    // `bufs[slot]` until `slot` is returned to the slots vector.
-    if unsafe { sq.push(&sqe) }.is_err() {
-        return Err(slot);
-    }
-
-    // SAFETY: By construction instances of SlotIdx are always in bounds.
-    #[allow(unsafe_code)]
-    unsafe {
-        *bufs.get_unchecked_mut(slot.idx()) = Some(buf)
-    };
-
-    Ok(())
-}
-
-fn push_tx_events_to(
-    sbmt: &Submitter,
-    sq: &mut SubmissionQueue,
-    txq: &mut mpsc::Receiver<Bytes>,
-    slots: &mut Vec<SlotIdx>,
-    bufs: &mut [Option<Bytes>],
-) -> Result<()> {
-    while !slots.is_empty() {
-        if sq.is_full() {
-            match sbmt.submit() {
-                Ok(_) => (),
-                Err(ref err) if err.raw_os_error() == Some(libc::EBUSY) => break,
-                Err(err) => {
-                    return Err(anyhow!(err)).context("Push TX events failed for sq submit");
-                }
-            }
-        }
-        sq.sync();
-
-        match txq.try_recv() {
-            Ok(buf) => {
-                let slot = slots.pop().expect("no tx slots left"); // we are inside `!slots.is_empty()`.
-                if let Err(slot) = push_one_tx_event_to(buf, sq, bufs, slot) {
-                    slots.push(slot);
-                    break;
-                }
-            }
-            Err(mpsc::error::TryRecvError::Empty) => {
-                break;
-            }
-            Err(err) => {
-                return Err(anyhow!(err)).context("Push TX events failed for try_recv");
+        let _guard = self.submission_lock.lock();
+        unsafe {
+            match self.ring.submission_shared().push(&write_op) {
+                Ok(_) => IOCallbackResult::Ok(len),
+                Err(_) => IOCallbackResult::WouldBlock,
             }
         }
     }
-    Ok(())
-}
 
-fn push_rx_events_to(
-    sbmt: &Submitter,
-    sq: &mut SubmissionQueue,
-    slots: &mut Vec<SlotIdx>,
-    state: &mut [RxState],
-) -> Result<()> {
-    loop {
-        if sq.is_full() {
-            match sbmt.submit() {
-                Ok(_) => (),
-                Err(ref err) if err.raw_os_error() == Some(libc::EBUSY) => break,
-                Err(err) => {
-                    return Err(anyhow!(err)).context("Push RX events failed for sq submit");
-                }
-            }
+    /// Receive packet from Tun device
+    pub async fn recv(&self) -> IOCallbackResult<BytesMut> {
+        let idx = self.rx_pool.read_idx.load(Ordering::Relaxed) % self.rx_pool.buffers.len();
+        let buffer = &self.rx_pool.buffers[idx];
+
+        if buffer
+            .state
+            .compare_exchange(2, 0, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            let len = buffer.length.load(Ordering::Acquire) as usize;
+            let mut new_buf = BytesMut::with_capacity(len);
+            unsafe { new_buf.extend_from_slice(&(*buffer.data.get())[..len]) };
+            self.rx_pool.read_idx.fetch_add(1, Ordering::Release);
+            return IOCallbackResult::Ok(new_buf);
         }
-        sq.sync();
-
-        match slots.pop() {
-            Some(slot) => {
-                // SAFETY: By construction instances of SlotIdx are always in bounds.
-                #[allow(unsafe_code)]
-                let state = unsafe { state.get_unchecked_mut(slot.idx()) };
-
-                // queue a new rx
-                let sqe = opcode::Read::new(
-                    Fixed(REGISTERED_FD_INDEX),
-                    state.buf.as_mut_ptr(),
-                    state.buf.capacity() as _,
-                )
-                .build()
-                .user_data(slot.user_data());
-                #[allow(unsafe_code)]
-                // SAFETY: sqe points to a buffer on the heap, owned
-                // by a `BytesMut` in `rx_bufs[slot]`, we will not reuse
-                // `rx_bufs[slot]` until `slot` is returned to the slots vector.
-                if unsafe { sq.push(&sqe) }.is_err() {
-                    slots.push(slot);
-                    break;
-                }
-            }
-            None => break,
-        }
+        IOCallbackResult::WouldBlock
     }
-
-    Ok(())
 }
 
+#[allow(unsafe_code)]
 async fn iouring_task(
     fd: RawFd,
-    ring_size: usize,
-    mtu: usize,
-    sqpoll_idle_time: Duration,
-    mut tx_queue: mpsc::Receiver<Bytes>,
-    rx_queue: mpsc::Sender<BytesMut>,
+    rx_pool: Arc<BufferPool>,
+    tx_pool: Arc<BufferPool>,
+    ring: Arc<IoUring>,
+    submission_lock: Arc<Mutex<()>>,
 ) -> Result<()> {
-    let mut event_fd: EventFd = EventFd::new(0, false)?;
-    let mut builder: Builder<SEntry, CEntry> = IoUring::builder();
+    let rx_len = rx_pool.buffers.len();
+    let mut iovecs = Vec::with_capacity(rx_len + tx_pool.buffers.len());
 
-    if sqpoll_idle_time.as_millis() > 0 {
-        let idle_time: u32 = sqpoll_idle_time
-            .as_millis()
-            .try_into()
-            .with_context(|| "invalid sqpoll idle time")?;
-        // This setting makes CPU go 100% when there is continuous traffic
-        builder.setup_sqpoll(idle_time); // Needs 5.13
-    }
-    let mut ring = builder
-        .build(ring_size as u32)
-        .inspect_err(|e| tracing::error!("iouring setup failed: {e}"))?;
+    iovecs.extend(rx_pool.buffers.iter().map(|buf| iovec {
+        iov_base: buf.data.get() as *mut libc::c_void,
+        iov_len: BUFFER_SIZE,
+    }));
 
-    let (sbmt, mut sq, mut cq) = ring.split();
+    iovecs.extend(tx_pool.buffers.iter().map(|buf| iovec {
+        iov_base: buf.data.get() as *mut libc::c_void,
+        iov_len: BUFFER_SIZE,
+    }));
 
-    // Register event-fd to cqe entries
-    sbmt.register_eventfd(event_fd.as_raw_fd())?;
-    sbmt.register_files(&[fd])?;
+    unsafe { ring.submitter().register_buffers(&iovecs)? };
 
-    // Using half of total io-uring size for rx and half for tx
-    let nr_tx_rx_slots = (ring_size / 2) as isize;
-    tracing::info!(
-        ring_size,
-        nr_tx_rx_slots,
-        ?sqpoll_idle_time,
-        "uring main task"
-    );
-
-    let mut rx_slots: Vec<_> = (0..nr_tx_rx_slots).map(SlotIdx::Rx).collect();
-    let mut rx_state: Vec<_> = rx_slots
-        .iter()
-        .map(|_| RxState {
-            sender: None,
-            buf: BytesMut::with_capacity(mtu),
-        })
-        .collect();
-    for state in rx_state.iter_mut() {
-        state.sender = Some(rx_queue.clone().reserve_owned().await?)
-    }
-
-    let rx_sq_entries: Vec<_> = rx_slots
-        .drain(..)
-        .map(|slot| {
-            let state = &mut rx_state[slot.idx()];
-            opcode::Read::new(
-                Fixed(REGISTERED_FD_INDEX),
-                state.buf.as_mut_ptr(),
-                state.buf.capacity() as _,
+    // Initial submission of read operations
+    {
+        let _guard = submission_lock.lock();
+        let mut sq = unsafe { ring.submission_shared() };
+        for idx in 0..rx_len {
+            let read_op = opcode::ReadFixed::new(
+                types::Fd(fd),
+                rx_pool.buffers[idx].data.get() as *mut u8,
+                BUFFER_SIZE as _,
+                idx as _,
             )
             .build()
-            .user_data(slot.user_data())
-        })
-        .collect();
+            .user_data(idx as u64);
 
-    // SAFETY: sqe points to a buffer on the heap, owned
-    // by a `BytesMut` in `rx_bufs[slot]`, we will not reuse
-    // `rx_bufs[slot]` until `slot` is returned to the slots vector.
-    #[allow(unsafe_code)]
-    unsafe {
-        let entries = rx_sq_entries;
-        // This call should not fail since the SubmissionQueue should be empty now
-        sq.push_multiple(&entries)?
-    };
-    sq.sync();
+            unsafe { sq.push(&read_op)? };
+            rx_pool.buffers[idx].state.store(1, Ordering::Release);
+        }
+    }
 
-    let mut tx_slots: Vec<_> = (0..nr_tx_rx_slots).map(SlotIdx::Tx).collect();
-    let mut tx_bufs = vec![None; tx_slots.len()];
-
-    tracing::info!("Entering i/o uring loop");
+    let in_flight_reads = AtomicUsize::new(rx_len);
 
     loop {
-        let _ = sbmt.submit()?;
+        ring.submit_and_wait(1)?;
 
-        cq.sync();
+        let mut reads_to_resubmit = false;
+        for cqe in unsafe { ring.completion_shared() } {
+            let user_data = cqe.user_data() as usize;
+            let result = cqe.result();
 
-        if cq.is_empty() && tx_queue.is_empty() {
-            let mut completed_number: [u8; 8] = [0; 8];
-            tokio::select! {
-                // There is no "wait until the queue contains
-                // something" method so we have to actually receive
-                // and treat that as a special case.
-                Some(buf) = tx_queue.recv(), if !tx_slots.is_empty() && !sq.is_full() => {
+            if user_data < rx_len {
+                let idx = user_data;
+                in_flight_reads.fetch_sub(1, Ordering::Release);
 
-                    let slot = tx_slots.pop().expect("no tx slots left"); // we are inside `!slots.is_empty()` guard.
-                    if let Err(slot) = push_one_tx_event_to(buf, &mut sq, &mut tx_bufs, slot) {
-                        tx_slots.push(slot);
+                if result > 0 {
+                    rx_pool.buffers[idx]
+                        .length
+                        .store(result as u32, Ordering::Release);
+                    rx_pool.buffers[idx].state.store(2, Ordering::Release);
+
+                    // Check if we need to resubmit batch
+                    if in_flight_reads.load(Ordering::Acquire) < (rx_len / 4) {
+                        reads_to_resubmit = true;
+                    }
+                } else {
+                    // Error or EOF case for read
+                    rx_pool.buffers[idx].state.store(0, Ordering::Release);
+                    reads_to_resubmit = true;
+                    if result < 0 {
+                        tracing::error!(
+                            "Read operation failed: {}",
+                            std::io::Error::from_raw_os_error(-result)
+                        );
+                        metrics::tun_iouring_rx_err();
                     }
                 }
-
-                Ok(a) = event_fd.read(&mut completed_number) => {
-                    assert_eq!(a, 8);
-                },
-
-            };
-            cq.sync();
+            } else {
+                // Write completion
+                let tx_idx = user_data - rx_len;
+                if result <= 0 {
+                    tracing::error!(
+                        "Write operation failed: {}",
+                        std::io::Error::from_raw_os_error(-result)
+                    );
+                    metrics::tun_iouring_tx_err();
+                }
+                tx_pool.buffers[tx_idx].state.store(0, Ordering::Release);
+            }
         }
 
-        // fill tx slots
-        push_tx_events_to(&sbmt, &mut sq, &mut tx_queue, &mut tx_slots, &mut tx_bufs)?;
+        // Batch resubmit of reads if needed
+        if reads_to_resubmit {
+            let _guard = submission_lock.lock();
+            let mut sq = unsafe { ring.submission_shared() };
 
-        // refill rx slots
-        push_rx_events_to(&sbmt, &mut sq, &mut rx_slots, &mut rx_state)?;
+            for idx in 0..rx_len {
+                if rx_pool.buffers[idx].state.load(Ordering::Acquire) == 0 {
+                    let read_op = opcode::ReadFixed::new(
+                        types::Fd(fd),
+                        rx_pool.buffers[idx].data.get() as *mut u8,
+                        BUFFER_SIZE as _,
+                        idx as _,
+                    )
+                    .build()
+                    .user_data(idx as u64);
 
-        sq.sync();
-
-        for cqe in &mut cq {
-            let res = cqe.result();
-            let slot = SlotIdx::from_user_data(cqe.user_data());
-
-            match slot {
-                SlotIdx::Rx(_) => {
-                    if res > 0 {
-                        // SAFETY: By construction instances of SlotIdx are always in bounds.
-                        #[allow(unsafe_code)]
-                        let RxState {
-                            sender: maybe_sender,
-                            buf,
-                        } = unsafe { rx_state.get_unchecked_mut(slot.idx()) };
-
-                        let mut buf = std::mem::replace(buf, BytesMut::with_capacity(mtu));
-
-                        // SAFETY: We trust that the read operation
-                        // returns the correct number of bytes received.
-                        #[allow(unsafe_code)]
-                        unsafe {
-                            buf.advance_mut(res as _);
-                        }
-
-                        if let Some(sender) = maybe_sender.take() {
-                            let sender = sender.send(buf);
-                            maybe_sender.replace(sender.reserve_owned().await?);
-                        } else {
-                            panic!("inflight rx state with no sender!");
-                        };
-                    } else if res != -libc::EAGAIN {
-                        metrics::tun_iouring_rx_err();
-                    };
-
-                    rx_slots.push(slot);
-                }
-                SlotIdx::Tx(_) => {
-                    if res <= 0 {
-                        tracing::info!("rx slot {slot:?} completed with {res}");
+                    if unsafe { sq.push(&read_op) }.is_ok() {
+                        rx_pool.buffers[idx].state.store(1, Ordering::Release);
+                        in_flight_reads.fetch_add(1, Ordering::Release);
                     }
-                    // handle tx complete, we just need to drop the buffer
-                    // SAFETY: By construction instances of SlotIdx are always in bounds.
-                    #[allow(unsafe_code)]
-                    unsafe {
-                        *tx_bufs.get_unchecked_mut(slot.idx()) = None
-                    };
-                    tx_slots.push(slot);
                 }
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use test_case::test_case;
-
-    #[test_case(SlotIdx::Tx(0) => 0x0000_0000_0000_0000)]
-    #[test_case(SlotIdx::Tx(10) => 0x0000_0000_0000_000a)]
-    #[test_case(SlotIdx::Tx(isize::MAX) => 0x7fff_ffff_ffff_ffff)]
-    #[test_case(SlotIdx::Rx(0) => 0x0000_0000_0000_0000)]
-    #[test_case(SlotIdx::Rx(10) => 0x0000_0000_0000_000a)]
-    #[test_case(SlotIdx::Rx(isize::MAX) => 0x7fff_ffff_ffff_ffff)]
-    fn slotid_idx(id: SlotIdx) -> usize {
-        id.idx()
-    }
-
-    #[test_case(SlotIdx::Tx(0) => 0x0000_0000_0000_0000)]
-    #[test_case(SlotIdx::Tx(10) => 0x0000_0000_0000_000a)]
-    #[test_case(SlotIdx::Tx(isize::MAX) => 0x7fff_ffff_ffff_ffff)]
-    #[test_case(SlotIdx::Rx(0) => 0xffff_ffff_ffff_ffff)]
-    #[test_case(SlotIdx::Rx(10) => 0xffff_ffff_ffff_fff5)]
-    #[test_case(SlotIdx::Rx(isize::MAX) => 0x8000_0000_0000_0000)]
-    fn slotid_user_data(id: SlotIdx) -> u64 {
-        id.user_data()
-    }
-
-    #[test_case(0x0000_0000_0000_0000 => matches SlotIdx::Tx(0))]
-    #[test_case(0x0000_0000_0000_000a => matches SlotIdx::Tx(10))]
-    #[test_case(0x7fff_ffff_ffff_ffff => matches SlotIdx::Tx(isize::MAX))]
-    #[test_case(0xffff_ffff_ffff_ffff => matches SlotIdx::Rx(0))]
-    #[test_case(0xffff_ffff_ffff_fff5 => matches SlotIdx::Rx(10))]
-    #[test_case(0x8000_0000_0000_0000 => matches SlotIdx::Rx(isize::MAX))]
-    fn slotid_from(u: u64) -> SlotIdx {
-        SlotIdx::from_user_data(u)
     }
 }

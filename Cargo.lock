@@ -1218,6 +1218,7 @@ dependencies = [
  "libc",
  "lightway-core",
  "metrics",
+ "parking_lot",
  "pnet",
  "serde",
  "serde_with",
