@@ -12,6 +12,7 @@ license = "AGPL-3.0-only"
 default = ["io-uring"]
 debug = ["lightway-core/debug"]
 io-uring = ["lightway-app-utils/io-uring"]
+iouring-bufsize = ["lightway-app-utils/iouring-bufsize"]
 
 [lints]
 workspace = true
