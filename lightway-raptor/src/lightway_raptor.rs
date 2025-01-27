@@ -3,10 +3,8 @@ use anyhow::Result;
 use raptorq::{Decoder, Encoder, EncodingPacket, ObjectTransmissionInformation}; // Replace `some_module` with the actual module name where LightwayDataFrame is defined.
 
 use std::collections::HashMap;
-use tokio::{
-    net::UdpSocket,
-    time::{Duration, Instant},
-};
+use tokio::net::UdpSocket;
+use tokio::time::{Duration, Instant};
 
 #[derive(Debug)]
 struct DecoderState {
@@ -21,7 +19,7 @@ pub struct Raptor {
     /// Maximum Transmission Unit (MTU) size. Used to control the size of symbols.
     mtu: Option<u16>,
     /// The underlying UDP socket. We can both send & receive on this socket.
-    socket: UdpSocket,
+    pub socket: UdpSocket,
 
     /// The remote to which we send frames. If you’re truly P2P,
     /// you might store multiple remotes or discover them dynamically.
@@ -29,12 +27,6 @@ pub struct Raptor {
 
     /// Outgoing aggregator that stores packets to be encoded.
     outgoing_frame: LightwayDataFrame,
-
-    /// Size limit (in bytes) before we decide to flush.
-    x_kb_limit: usize,
-
-    /// Time in ms before a flush is triggered due to inactivity.
-    y_ms_timeout: u64,
 
     /// Internal counter for sending frames (frame IDs).
     next_frame_id: u16,
@@ -44,48 +36,27 @@ pub struct Raptor {
 
     /// How long to keep incomplete decoders before discarding.
     decode_timeout_secs: u64,
+
+    /// Number of repair symbols per frame
+    num_of_repair_symbols: u32,
+}
+
+pub struct NoRaptor {
+    /// The underlying UDP socket. We can both send & receive on this socket.
+    pub socket: UdpSocket,
+
+    /// The remote to which we send frames. If you’re truly P2P,
+    /// you might store multiple remotes or discover them dynamically.
+    remote_addr: Option<std::net::SocketAddr>,
+
+    /// Outgoing aggregator that stores packets to be encoded.
+    outgoing_frame: LightwayDataFrame,
+
+    /// Internal counter for sending frames (frame IDs).
+    next_frame_id: u16,
 }
 
 impl Raptor {
-    /// Runs the main Raptor engine loop to process incoming packets and handle send/timeout logic.
-    ///
-    /// This future must be awaited in your asynchronous runtime.
-    pub async fn run_engine(&mut self) -> Result<()> {
-        let mut deadline = Instant::now() + Duration::from_millis(self.y_ms_timeout);
-
-        loop {
-            println!("[Raptor] Waiting for incoming data...");
-            let mut pkt = vec![0u8; 1500]; // Max UDP packet size
-
-            tokio::select! {
-                result = self.socket.recv_from(&mut pkt) => {
-                    let (len, _addr) = result?;
-                    pkt.truncate(len);
-
-                    // Add the received data to the outgoing aggregator
-                    self.outgoing_frame.add_packet(pkt);
-
-                    // If size limit is reached, flush the aggregator
-                    if self.outgoing_frame.len() >= self.x_kb_limit {
-                        self.flush().await?;
-                        deadline = Instant::now() + Duration::from_millis(self.y_ms_timeout);
-                    } else {
-                        // Reset the deadline as we received data
-                        deadline = Instant::now() + Duration::from_millis(self.y_ms_timeout);
-                    }
-                }
-                _ = tokio::time::sleep_until(deadline) => {
-                        println!("[Raptor] Timeout reached!");
-                    // Timeout occurred, check if there is data to flush
-                    if !self.outgoing_frame.is_empty() {
-                        self.flush().await?;
-                    }
-                    // Reset the deadline for the next timeout
-                    deadline = Instant::now() + Duration::from_millis(self.y_ms_timeout);
-                }
-            }
-        }
-    }
     /// Create a new Raptor instance.
     ///
     /// * `socket` is a bound UdpSocket that we’ll use to both send & receive.
@@ -96,21 +67,19 @@ impl Raptor {
     pub fn new(
         socket: UdpSocket,
         remote_addr: Option<std::net::SocketAddr>,
-        x_kb_limit: usize,
-        y_ms_timeout: u64,
         decode_timeout_secs: u64,
         mtu: Option<u16>,
+        num_of_repair_symbols: u32,
     ) -> Self {
         Self {
             socket,
             remote_addr,
             outgoing_frame: LightwayDataFrame::new_empty(),
-            x_kb_limit,
-            y_ms_timeout,
             next_frame_id: 0,
             decoders: HashMap::new(),
             decode_timeout_secs,
-            mtu: None,
+            mtu,
+            num_of_repair_symbols,
         }
     }
 
@@ -127,39 +96,42 @@ impl Raptor {
     /// Encode and send the current aggregator as a single RaptorQ frame.
     ///
     /// You can call this manually or from a background loop after a timeout.
-    pub async fn flush(&mut self) -> Result<()> {
+    /// returns time taken to encode
+    pub async fn flush(&mut self) -> Result<Duration> {
         // If empty, do nothing
         if self.outgoing_frame.is_empty() {
-            return Ok(());
+            return Ok(Duration::from_millis(0));
         }
 
         let serialized_data = self.outgoing_frame.serialize()?;
-        // Create RaptorQ encoder
-        //let encoder = Encoder::with_defaults(&serialized_data, self.outgoing_frame.largest_packet_length() as u16);
 
         // Determine the maximum symbol size, using the smaller of mtu (if set) and largest_packet_length
         let max_symbol_size = match self.mtu {
-            Some(mtu) => mtu.min(self.outgoing_frame.largest_packet_length() as u16),
+            Some(mtu) => (mtu - 19).min(self.outgoing_frame.largest_packet_length() as u16), // 14 bytes reserved for the header + 5 bytes for the symbol header
             None => self.outgoing_frame.largest_packet_length() as u16,
         };
 
+        // Check the time taken to encode the packets
+        let encoding_start_time = tokio::time::Instant::now();
+
         // Create RaptorQ encoder with the determined max symbol size
         let encoder = Encoder::with_defaults(&serialized_data, max_symbol_size);
+        let encoding_end_time = tokio::time::Instant::now();
 
-        // Decide how many encoding packets to send
-        let symbol_count = self.outgoing_frame.packet_count() as u32 + 4;
+        // Generate encoded packets
         let encoded_symbols: Vec<Vec<u8>> = encoder
-            .get_encoded_packets(symbol_count)
+            .get_encoded_packets(self.num_of_repair_symbols)
             .iter()
             .map(|sym| sym.serialize())
             .collect();
 
-        // For each symbol, prepend frame_id + OTI (12 bytes) to form one UDP packet
+        // Get the frame id of the current frame
         let frame_id = self.next_frame_id;
         self.next_frame_id = self.next_frame_id.wrapping_add(1);
 
+        // For each symbol of the frame, prepend frame_id + OTI (12 bytes) to form one UDP packet
         for symbol in encoded_symbols {
-            let mut buf = Vec::with_capacity(symbol.len() + 14);
+            let mut buf: Vec<u8> = Vec::with_capacity(symbol.len() + 14);
             // 2 bytes frame_id (LE)
             buf.extend_from_slice(&frame_id.to_le_bytes());
             // 12 bytes OTI
@@ -177,16 +149,19 @@ impl Raptor {
             }
         }
 
-        println!(
-            "[Raptor] Flushed frame_id={} with {} symbols (packets={})",
-            frame_id,
-            symbol_count as usize,
-            self.outgoing_frame.packet_count()
-        );
+        // println!(
+        //     "[Raptor] Flushed frame_id={} with {} source symbols and {} repair symbols. (packets={})",
+        //     frame_id,
+        //     num_of_encoded_symbols - self.num_of_repair_symbols as usize,
+        //     self.num_of_repair_symbols,
+        //     num_of_encoded_symbols
+        // );
 
         // Clear aggregator
         self.outgoing_frame.clear();
-        Ok(())
+
+        // Return the time taken to encode the packets
+        Ok(encoding_end_time - encoding_start_time)
     }
 
     // -------------------------------------------------
@@ -194,14 +169,15 @@ impl Raptor {
     // -------------------------------------------------
 
     /// Process an incoming Raptor-encoded symbol from `data`.
-    /// If a frame completes, returns `Ok(Some(Vec<Vec<u8>>))`
+    /// If a frame completes, returns `Ok(frame_id, Some(Vec<Vec<u8>>))`
     /// containing the original packets that were encoded.
-    /// If the frame is not yet complete, returns `Ok(None)`.
-    pub fn process_incoming(&mut self, data: &[u8]) -> Result<Option<Vec<Vec<u8>>>> {
+    /// If the frame is not yet complete, returns `Ok(frame_id, None)`.
+    /// If the frame is invalid, returns `Ok(None, None)`
+    pub fn process_incoming(&mut self, data: &[u8]) -> Result<(Option<u16>, Option<Vec<Vec<u8>>>)> {
         // Minimal check
         if data.len() < 14 {
             eprintln!("Incoming packet too short: len={}", data.len());
-            return Ok(None);
+            return Ok((None, None));
         }
 
         // Extract frame_id
@@ -225,7 +201,7 @@ impl Raptor {
 
         if entry.completed {
             // Already done? Possibly a duplicate
-            return Ok(None);
+            return Ok((Some(frame_id), None));
         }
 
         entry.last_updated = Instant::now();
@@ -238,7 +214,6 @@ impl Raptor {
         if let Some(decoded_bytes) = maybe_data {
             // Mark as complete
             entry.completed = true;
-            println!("[Raptor] Decoded complete frame_id={}", frame_id);
 
             // Attempt to parse as LightwayDataFrame
             match LightwayDataFrame::deserialize(&decoded_bytes) {
@@ -250,32 +225,32 @@ impl Raptor {
                         .map(|p| p.to_vec())
                         .collect();
                     // Optionally remove from the map
-                    // self.decoders.remove(&frame_id);
-                    return Ok(Some(packets));
+                    self.decoders.remove(&frame_id);
+                    return Ok((Some(frame_id), Some(packets)));
                 }
                 Err(e) => {
                     eprintln!("Failed to deserialize LightwayDataFrame: {e}");
                     // We have the raw bytes, but can’t parse them.
                     // Return None (or Some(...) if you want to just pass raw).
-                    return Ok(None);
+                    return Ok((Some(frame_id), None));
                 }
             }
         }
 
         // Not yet complete
-        Ok(None)
+        Ok((Some(frame_id), None))
     }
 
     /// Remove stale decoders older than `decode_timeout_secs`.
-    /// You might call this periodically in a background task.
+    /// You might call this periodically in a background task
     pub fn cleanup_decoders(&mut self) {
         let now = Instant::now();
         let timeout = Duration::from_secs(self.decode_timeout_secs);
         let before = self.decoders.len();
-        self.decoders.retain(|_frame_id, st| {
+        self.decoders.retain(|frame_id, st| {
             let age = now.duration_since(st.last_updated);
             if age > timeout {
-                println!("[Raptor] Removing stale decoder after {age:?}");
+                println!("[Raptor] Removing stale decoder {frame_id} after {age:?}");
                 false
             } else {
                 true
@@ -285,5 +260,53 @@ impl Raptor {
         if after < before {
             println!("[Raptor] Cleaned up {} old decoders", before - after);
         }
+    }
+}
+
+impl NoRaptor {
+    pub fn new(socket: UdpSocket, remote_addr: Option<std::net::SocketAddr>) -> Self {
+        Self {
+            socket,
+            remote_addr,
+            outgoing_frame: LightwayDataFrame::new_empty(),
+            next_frame_id: 0,
+        }
+    }
+
+    pub fn send_packet(&mut self, data: &[u8]) {
+        self.outgoing_frame.add_packet(data.to_vec());
+    }
+
+    pub async fn flush(&mut self) -> Result<()> {
+        // If empty, do nothing
+        if self.outgoing_frame.is_empty() {
+            return Ok(());
+        }
+
+        // Get the frame id of the current frame
+        let frame_id = self.next_frame_id;
+        self.next_frame_id = self.next_frame_id.wrapping_add(1);
+
+        // For each packet of the frame, prepend frame_id to form one UDP packet
+        for packet in self.outgoing_frame.get_all_packets() {
+            let mut buf: Vec<u8> = Vec::with_capacity(packet.len() + 14);
+            // 2 bytes frame_id (LE)
+            buf.extend_from_slice(&frame_id.to_le_bytes());
+            // symbol
+            buf.extend_from_slice(&packet);
+
+            // Send out
+            if let Some(remote) = self.remote_addr {
+                self.socket.send_to(&buf, remote).await?;
+            } else {
+                // If remote_addr is None, you might handle that differently:
+                // e.g. broadcast, or store a list of remote peers, etc.
+                eprintln!("No remote_addr configured for sending!");
+            }
+        }
+
+        // Clear aggregator
+        self.outgoing_frame.clear();
+        Ok(())
     }
 }
