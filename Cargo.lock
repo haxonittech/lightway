@@ -527,7 +527,6 @@ dependencies = [
  "ciborium",
  "clap",
  "criterion-plot",
- "futures",
  "is-terminal",
  "itertools 0.10.5",
  "num-traits",
@@ -540,7 +539,6 @@ dependencies = [
  "serde_derive",
  "serde_json",
  "tinytemplate",
- "tokio",
  "walkdir",
 ]
 
@@ -1455,6 +1453,7 @@ name = "lightway-raptor"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "criterion",
  "rand 0.9.0-beta.3",
  "raptorq",

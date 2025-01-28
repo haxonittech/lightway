@@ -2,6 +2,7 @@
 
 pub mod lightway_data_frame;
 pub mod lightway_raptor;
+pub mod no_raptor;
 
 pub use lightway_data_frame::LightwayDataFrame;
-pub use lightway_raptor::Raptor;
+pub use lightway_raptor::{Raptor, Transceive};
