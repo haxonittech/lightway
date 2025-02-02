@@ -1,7 +1,7 @@
 use crate::metrics;
 use anyhow::Result;
 use bytes::BytesMut;
-use io_uring::{opcode, types, IoUring};
+use io_uring::{IoUring, opcode, types};
 use libc::iovec;
 use lightway_core::IOCallbackResult;
 use parking_lot::Mutex;
@@ -9,8 +9,8 @@ use std::{
     cell::UnsafeCell,
     os::unix::io::{AsRawFd, RawFd},
     sync::{
-        atomic::{AtomicU32, AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicU32, AtomicUsize, Ordering},
     },
     thread,
     time::Duration,
