@@ -107,10 +107,10 @@ impl Transceive for NoRaptor {
             return Ok((Some(frame_id), result));
         }
 
-        println!(
-            "frame {frame_id} still has {} left",
-            self.number_of_packets_per_frame - entry.len()
-        );
+        // println!(
+        //     "frame {frame_id} still has {} left",
+        //     self.number_of_packets_per_frame - entry.len()
+        // );
 
         // Not yet complete
         Ok((Some(frame_id), None))
