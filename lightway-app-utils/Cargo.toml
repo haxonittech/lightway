@@ -12,7 +12,6 @@ readme = "README.md"
 [features]
 default = [ "tokio" ]
 io-uring = [ "dep:io-uring", "dep:tokio", "dep:tokio-eventfd", "dep:parking_lot" ]
-iouring-bufsize = [] # Rust does bi-directional dependencies
 tokio = [ "dep:tokio", "dep:tokio-stream" ]
 
 [lints]
