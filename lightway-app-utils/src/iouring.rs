@@ -141,11 +141,11 @@ impl<T: AsRawFd> IOUring<T> {
 
             // Safety: Ring is initialized and file descriptor is valid
             unsafe {
-                sq.push(
-                    &opcode::RecvMulti::new(types::Fd(fd), RX_BUFFER_GROUP)
+                let op = opcode::RecvMulti::new(types::Fd(fd), RX_BUFFER_GROUP)
                         .build()
-                        .user_data(IOUringActionID::ReceivedBuffer as u64),
-                )?
+                        .user_data(IOUringActionID::ReceivedBuffer as u64);
+                tracing::debug!("Started recv-multi: {}", op);
+                sq.push(&op)?;
             };
         }
 
