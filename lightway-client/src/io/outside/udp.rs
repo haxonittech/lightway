@@ -9,7 +9,7 @@ use lightway_core::{IOCallbackResult, OutsideIOSendCallback, OutsideIOSendCallba
 
 pub struct Udp {
     sock: tokio::net::UdpSocket,
-    peer_addr: SocketAddr,
+    pub peer_addr: SocketAddr,
     default_ip_pmtudisc: sockopt::IpPmtudisc,
 }
 

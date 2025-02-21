@@ -6,7 +6,7 @@ use tokio::net::TcpStream;
 use super::OutsideIO;
 use lightway_core::{IOCallbackResult, OutsideIOSendCallback, OutsideIOSendCallbackArg};
 
-pub struct Tcp(tokio::net::TcpStream, SocketAddr);
+pub struct Tcp(tokio::net::TcpStream, pub SocketAddr);
 
 impl Tcp {
     pub async fn new(remote_addr: &str, maybe_sock: Option<TcpStream>) -> Result<Arc<Self>> {

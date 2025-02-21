@@ -1,6 +1,7 @@
 mod debug;
 pub mod io;
 pub mod keepalive;
+mod routing_table;
 
 use anyhow::{anyhow, Context, Result};
 use bytes::BytesMut;
@@ -16,6 +17,7 @@ use lightway_core::{
     ClientIpConfig, Connection, ConnectionError, ConnectionType, Event, EventCallback,
     IOCallbackResult, InsideIpConfig, OutsidePacket, State,
 };
+use routing_table::{RoutingMode, RoutingTable};
 
 // re-export so client app does not need to depend on lightway-core
 #[cfg(feature = "debug")]
@@ -89,6 +91,9 @@ pub struct ClientConfig<'cert, A: 'static + Send + EventCallback> {
 
     /// Tun device to use
     pub tun_config: TunConfig,
+
+    /// The name of Tun device
+    pub tun_name: String,
 
     /// Local IP to use in Tun device
     pub tun_local_ip: Ipv4Addr,
@@ -367,12 +372,14 @@ pub async fn client<A: 'static + Send + EventCallback>(
 
     let mut join_set = JoinSet::new();
 
+    let peer_socket_addr;
     let (connection_type, outside_io): (ConnectionType, Arc<dyn io::outside::OutsideIO>) =
         match config.mode {
             ClientConnectionType::Datagram(maybe_sock) => {
                 let sock = io::outside::Udp::new(&config.server, maybe_sock)
                     .await
                     .context("Outside IO UDP")?;
+                peer_socket_addr = sock.peer_addr;
 
                 (ConnectionType::Datagram, sock)
             }
@@ -380,6 +387,8 @@ pub async fn client<A: 'static + Send + EventCallback>(
                 let sock = io::outside::Tcp::new(&config.server, maybe_sock)
                     .await
                     .context("Outside IO TCP")?;
+                peer_socket_addr = sock.1;
+
                 (ConnectionType::Stream, sock)
             }
         };
@@ -410,6 +419,11 @@ pub async fn client<A: 'static + Send + EventCallback>(
         .await
         .context("Tun creation")?,
     );
+
+    let mut routing_table_handle = RoutingTable::new(RoutingMode::Default)?;
+    routing_table_handle
+        .initialize_routing_table(config.tun_peer_ip, peer_socket_addr.ip(), &config.tun_name)
+        .await?;
 
     let (event_cb, event_stream) = EventStreamCallback::new();
 
@@ -496,7 +510,7 @@ pub async fn client<A: 'static + Send + EventCallback>(
             None => None.into(),
         };
 
-    tokio::select! {
+    let result = tokio::select! {
         Some(_) = keepalive_task => Err(anyhow!("Keepalive timeout")),
         io = outside_io_loop => Err(anyhow!("Outside IO loop exited: {io:?}")),
         io = inside_io_loop => Err(anyhow!("Inside IO loop exited: {io:?}")),
@@ -516,5 +530,9 @@ pub async fn client<A: 'static + Send + EventCallback>(
                 }
             }
         },
-    }
+    };
+
+    routing_table_handle.clean_up_routes().await;
+
+    result
 }

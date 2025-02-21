@@ -30,15 +30,19 @@ futures = "0.3.30"
 libc.workspace = true
 lightway-app-utils.workspace = true
 lightway-core.workspace = true
+netdev = "0.32.0"
+net-route = "0.4.5"
 pnet.workspace = true
 serde = { workspace = true, features = ["derive"] }
 socket2.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
 tokio-stream = { workspace = true, features = ["time"] }
 tokio-util.workspace = true
 tracing.workspace = true
 tracing-subscriber = { workspace = true}
 twelf.workspace = true
+
 
 [dev-dependencies]
 more-asserts.workspace = true

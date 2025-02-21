@@ -60,7 +60,7 @@ async fn main() -> Result<()> {
     let root_ca_cert = RootCertificate::PemFileOrDirectory(&config.ca_cert);
 
     let mut tun_config = TunConfig::default();
-    tun_config.tun_name(config.tun_name);
+    tun_config.tun_name(config.tun_name.clone());
     if let Some(inside_mtu) = &config.inside_mtu {
         tun_config.mtu(*inside_mtu);
     }
@@ -80,6 +80,7 @@ async fn main() -> Result<()> {
         outside_mtu: config.outside_mtu,
         inside_mtu: config.inside_mtu,
         tun_config,
+        tun_name: config.tun_name,
         tun_local_ip: config.tun_local_ip,
         tun_peer_ip: config.tun_peer_ip,
         tun_dns_ip: config.tun_dns_ip,
