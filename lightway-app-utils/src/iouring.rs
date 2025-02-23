@@ -7,7 +7,7 @@ use lightway_core::IOCallbackResult;
 use parking_lot::Mutex;
 use std::{
     alloc::{alloc_zeroed, dealloc, Layout},
-    os::{fd::AsRawFd, unix::io::RawFd},
+    os::fd::AsRawFd,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -16,11 +16,12 @@ use std::{
     time::Duration,
 };
 use tokio::sync::Notify;
-use tokio_eventfd::EventFd;
 
 // -------------------------------------------------------------
 // -      IMPLEMENT read-multishot and RUNTIME variations      -
 // -------------------------------------------------------------
+
+// NOTE: temp until this is merged: https://github.com/tokio-rs/io-uring/pull/317
 
 use io_uring::squeue::Entry;
 
@@ -241,7 +242,6 @@ pub unsafe fn queue_reads(
 enum IOUringActionID {
     RecycleBuffers = 0x10001000,
     ReceivedBuffer = 0xfeedfeed,
-    RecyclePending = 0xdead1000,
 }
 const RX_BUFFER_GROUP: u16 = 0xdead;
 
@@ -368,8 +368,6 @@ pub struct IOUring<T: AsRawFd> {
     rx_pool: Arc<BufferPool>,
     tx_pool: Arc<BufferPool>,
     rx_notify: Arc<Notify>,
-    rx_eventfd: EventFd,
-    rx_provide_buffers: Arc<AtomicBool>,
     ring: Arc<IoUring>,
     submission_lock: Arc<Mutex<()>>,
 }
@@ -391,7 +389,7 @@ impl<T: AsRawFd> IOUring<T> {
         tracing::debug!(
             "INIT io-uring, estimated memory (user | kernel): {}Mb | {}Mb",
             (2 * (size_of::<BufferPool>() + (mtu * ring_size))) / 1024 / 1024,
-            (ring_size * (16 + (2 * 64)) + 8192) / 1024 / 1024,
+            (ring_size * 2 * (16 + (2 * 64)) + 8192) / 1024 / 1024,
         );
 
         let rx_pool = Arc::new(BufferPool::new(mtu, ring_size));
@@ -400,12 +398,10 @@ impl<T: AsRawFd> IOUring<T> {
         let ring = Arc::new(
             IoUring::builder()
                 .setup_sqpoll(sqpoll_idle_time.as_millis() as u32)
-                .build(ring_size as u32)?,
+                .build((ring_size * 2) as u32)?,
         );
 
         let rx_notify = Arc::new(Notify::new());
-        let rx_eventfd = EventFd::new(0, false)?;
-        let rx_provide_buffers = Arc::new(AtomicBool::new(false));
 
         // NOTE: for now this ensures we only create 1 kthread per tunnel, and not 2 (rx/tx)
         //  we can opt to change this going forward, or redo the structure to not need a lock
@@ -484,14 +480,10 @@ impl<T: AsRawFd> IOUring<T> {
             .expect("io-uring support");
 
         let config = IOUringTaskConfig {
-            tun_fd: fd,
             rx_pool: rx_pool.clone(),
             tx_pool: tx_pool.clone(),
             rx_notify: rx_notify.clone(),
-            rx_eventfd: rx_eventfd.as_raw_fd(),
-            rx_provide_buffers: rx_provide_buffers.clone(),
             ring: ring.clone(),
-            submission_lock: submission_lock.clone(),
         };
 
         // NOTE: currently we don't implement any Drop for class, it will require changes
@@ -512,8 +504,6 @@ impl<T: AsRawFd> IOUring<T> {
             rx_pool,
             tx_pool,
             rx_notify,
-            rx_eventfd,
-            rx_provide_buffers,
             ring,
             submission_lock,
         })
@@ -569,15 +559,10 @@ impl<T: AsRawFd> IOUring<T> {
 
         // NOTE: IOUringActionID values have to be bigger then the ring-size
         //  this is because we use <index> here as data for send_fixed operations
-        let write_op = opcode::WriteFixed::new(
-            types::Fixed(self.owned_fd.as_raw_fd() as _),
-            buffer.as_ptr(),
-            len as _,
-            idx as _,
-        )
-        .build()
-        // NOTE: we set the index starting from after the RX_POOL part
-        .user_data(idx as u64);
+        let write_op =
+            opcode::WriteFixed::new(types::Fixed(0), buffer.as_ptr(), len as _, idx as _)
+                .build()
+                .user_data(idx as u64);
 
         tracing::debug!("queuing WRITE_FIXED on buf-id {}", idx);
 
@@ -588,11 +573,22 @@ impl<T: AsRawFd> IOUring<T> {
             let mut sq = unsafe { self.ring.submission_shared() };
             // Safety: entry uses buffers from tx_pool which outlive task using them
             unsafe {
+                // let res = libc::write(
+                //     self.owned_fd.as_raw_fd(),
+                //     buffer.as_ptr() as *const libc::c_void,
+                //     len,
+                // );
+                // tracing::debug!("write (sync) results: {}", res);
+                // if res > 0 {
+                //     return IOCallbackResult::Ok(res as usize);
+                // }
+
+                // let err = std::io::Error::last_os_error();
+                // tracing::error!("write faild: {}", err);
+                // IOCallbackResult::Err(err)
+
                 match sq.push(&write_op) {
-                    Ok(_) => {
-                        tracing::debug!("Successfully queued write for buffer {}", idx);
-                        IOCallbackResult::Ok(len)
-                    }
+                    Ok(_) => IOCallbackResult::Ok(len),
                     Err(_) => {
                         tracing::warn!("Failed to queue send");
                         metrics::tun_iouring_tx_err();
@@ -637,6 +633,41 @@ impl<T: AsRawFd> IOUring<T> {
                 .compare_exchange(true, false, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
             {
+                // Last buffer - need to reload
+                // NOTE: this is why io_uring is not really practical in a lot of use-cases...
+                if idx + 1 == self.rx_pool.data.num_entries {
+                    let _guard = self.submission_lock.lock();
+                    // Safety: protected by lock above
+                    let mut sq = unsafe { self.ring.submission_shared() };
+                    let rx_ring_size = self.rx_pool.states.len();
+                    // Safety: buffers are mapped from rx_pool which outlives this task
+                    unsafe {
+                        sq.push(
+                            &opcode::ProvideBuffers::new(
+                                self.rx_pool.data.as_ptr(),
+                                rx_ring_size as i32,
+                                self.rx_pool.states.len() as u16,
+                                RX_BUFFER_GROUP,
+                                0,
+                            )
+                            .build()
+                            .user_data(IOUringActionID::RecycleBuffers as u64),
+                        )
+                        .expect("iouring queue should work")
+                    };
+                    // Safety: buffer-group originates from rx_pool which outlives this task
+                    unsafe {
+                        queue_reads(
+                            &mut sq,
+                            self.owned_fd.as_raw_fd(),
+                            rx_ring_size,
+                            RX_BUFFER_GROUP,
+                            IOUringActionID::ReceivedBuffer as _,
+                        )
+                        .expect("iouring queue should work")
+                    };
+                }
+
                 let len = length.load(Ordering::Acquire);
                 let mut new_buf = BytesMut::with_capacity(len);
 
@@ -650,75 +681,28 @@ impl<T: AsRawFd> IOUring<T> {
             }
             // IO-Bound wait for available buffers
             self.rx_notify.notified().await;
-
-            // Check if kernel needs more buffers (and ensure only one notification is sent)
-            if self
-                .rx_provide_buffers
-                .compare_exchange(true, false, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
-            {
-                tracing::debug!("Need to notify task out-of-buffers");
-                // Safety: buffer is defined on stack, event-fd outlives task using it
-                unsafe {
-                    let val = 1u64;
-                    if libc::write(
-                        self.rx_eventfd.as_raw_fd(),
-                        &val as *const u64 as *const _,
-                        8,
-                    ) < 0
-                    {
-                        let err = std::io::Error::last_os_error();
-                        tracing::error!("Failed to write to eventfd: {}", err);
-                        // The following is a prayer to god to hopefully succeed next time around
-                        self.rx_provide_buffers.store(true, Ordering::Release);
-                    }
-                }
-            }
         }
     }
 }
 
 /// Task variables
 struct IOUringTaskConfig {
-    tun_fd: RawFd,
     rx_pool: Arc<BufferPool>,
     tx_pool: Arc<BufferPool>,
     rx_notify: Arc<Notify>,
-    rx_eventfd: RawFd,
-    rx_provide_buffers: Arc<AtomicBool>,
     ring: Arc<IoUring>,
-    submission_lock: Arc<Mutex<()>>,
 }
 
 // Safety: To manage ring completion and results effeciantly requires direct memory manipulations
 #[allow(unsafe_code)]
 async fn iouring_task(config: IOUringTaskConfig) -> Result<()> {
-    let mut eventfd_buf = [0u64; 1]; // Buffer for eventfd read (8 bytes)
-
-    tracing::debug!("Started iouring_task, queuing eventfd read");
-
-    // Submit initial read for eventfd (needs to be here for buffer to be on stack of the task)
-    {
-        let _guard = config.submission_lock.lock();
-        // Safety: protected by above lock
-        let mut sq = unsafe { config.ring.submission_shared() };
-        // Safety: event-fd outlives the task, queue protected by lock
-        unsafe {
-            sq.push(
-                &opcode::Read::new(
-                    types::Fd(config.rx_eventfd),
-                    eventfd_buf.as_mut_ptr() as *mut u8,
-                    8,
-                )
-                .build()
-                .user_data(IOUringActionID::RecyclePending as u64),
-            )?
-        };
-    }
+    tracing::debug!("Started iouring_task");
 
     loop {
         // Work once we have at least 1 task to perform
         config.ring.submit_and_wait(1)?;
+
+        tracing::debug!("iotask woke up");
 
         // Safety: only task is using the completion-queue (concept should not change)
         for cqe in unsafe { config.ring.completion_shared() } {
@@ -726,62 +710,6 @@ async fn iouring_task(config: IOUringTaskConfig) -> Result<()> {
                 x if x == IOUringActionID::RecycleBuffers as u64 => {
                     // Buffer provision completed
                     tracing::debug!("Buffer provision completed");
-                }
-
-                x if x == IOUringActionID::RecyclePending as u64 => {
-                    let cqe_res = cqe.result();
-                    tracing::debug!("Out of buffers ({}) - recycling", cqe_res);
-                    if cqe_res > 0 {
-                        // Got notification we need more buffers
-                        // NOTE: This approach is very good for cases we have constant data-flow
-                        //  we can only load the buffers for kernel when our read-threads are done with existing data,
-                        //  if our read-threads would block for too long elsewhere it would back-pressure the NIF device
-                        let _guard = config.submission_lock.lock();
-
-                        // Safety: protected by above lock
-                        let mut sq = unsafe { config.ring.submission_shared() };
-
-                        // Make sure kernel can use all buffers again
-                        {
-                            let rx_ring_size = config.rx_pool.states.len();
-                            // Safety: buffers are mapped from rx_pool which outlives this task
-                            unsafe {
-                                sq.push(
-                                    &opcode::ProvideBuffers::new(
-                                        config.rx_pool.data.as_ptr(),
-                                        rx_ring_size as i32,
-                                        config.rx_pool.states.len() as u16,
-                                        RX_BUFFER_GROUP,
-                                        0,
-                                    )
-                                    .build()
-                                    .user_data(IOUringActionID::RecycleBuffers as u64),
-                                )?
-                            };
-                            // Safety: buffer-group originates from rx_pool which outlives this task
-                            unsafe {
-                                queue_reads(
-                                    &mut sq,
-                                    config.tun_fd,
-                                    rx_ring_size,
-                                    RX_BUFFER_GROUP,
-                                    IOUringActionID::ReceivedBuffer as _,
-                                )?
-                            };
-                            // Safety: Event-fd outlives the task, buffer is task-bound (stack)
-                            unsafe {
-                                sq.push(
-                                    &opcode::Read::new(
-                                        types::Fd(config.rx_eventfd),
-                                        eventfd_buf.as_mut_ptr() as *mut u8,
-                                        8,
-                                    )
-                                    .build()
-                                    .user_data(IOUringActionID::RecyclePending as u64),
-                                )?
-                            };
-                        }
-                    }
                 }
 
                 x if x == IOUringActionID::ReceivedBuffer as u64 => {
@@ -804,9 +732,14 @@ async fn iouring_task(config: IOUringTaskConfig) -> Result<()> {
                     state.store(true, Ordering::Release); // Mark as ready-for-user
                     config.rx_notify.notify_waiters();
 
-                    if !io_uring::cqueue::more(cqe.flags()) {
-                        config.rx_provide_buffers.store(true, Ordering::Release);
-                    }
+                    // TODO: consider below implementation in the future
+                    //  issue with this is that we have to gurentee no in-flight buffers !
+                    //  see the comment under `recv` function, we can consider a buffer migration.
+                    // NOTE: Here if we use new kernels we can auto-opt for multishot via:
+                    //  if !io_uring::cqueue::more(cqe.flags()) {
+                    //      let opt = ReadMulti::new(fd, buf_group).build().user_data(IOUringActionID::ReceivedBuffer);
+                    //      unsafe { sq.push(&opt) };
+                    //  }
                 }
 
                 idx => {
