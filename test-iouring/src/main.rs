@@ -353,11 +353,13 @@ fn main() -> Result<()> {
     // Setup ring
     let mut ring = IoUring::new(8)?;
     println!("Created IO_URING");
-    
+
     // Register buffer and file
     #[allow(unsafe_code)]
+    // Safety: we manage buffer lifecycle
     unsafe {
-        ring.submitter().register_buffers(std::slice::from_ref(&iov))?;
+        ring.submitter()
+            .register_buffers(std::slice::from_ref(&iov))?;
         println!("Registered buffer");
         ring.submitter().register_files(&[tun.as_raw_fd()])?;
         println!("Registered TUN fd");
@@ -365,10 +367,10 @@ fn main() -> Result<()> {
 
     // Create WriteFixed operation
     let write_op = opcode::WriteFixed::new(
-        types::Fixed(0),      // registered file index
-        packet.as_ptr(),      // buffer pointer
-        packet.len() as _,    // length
-        0,                    // registered buffer index
+        types::Fixed(0),   // registered file index
+        packet.as_ptr(),   // buffer pointer
+        packet.len() as _, // length
+        0,                 // registered buffer index
     )
     .build()
     .user_data(100);
@@ -377,9 +379,9 @@ fn main() -> Result<()> {
 
     // Queue operation
     #[allow(unsafe_code)]
+    // Safety: io_uring crate works
     unsafe {
-        ring.submission()
-            .push(&write_op)?;
+        ring.submission().push(&write_op)?;
     }
     println!("Queued operation");
 

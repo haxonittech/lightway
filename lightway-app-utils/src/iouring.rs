@@ -1,12 +1,12 @@
 use crate::metrics;
 use anyhow::{Context, Result};
 use bytes::BytesMut;
-use io_uring::{opcode, squeue::PushError, types, IoUring};
+use io_uring::{IoUring, opcode, squeue::PushError, types};
 use libc::iovec;
 use lightway_core::IOCallbackResult;
 use parking_lot::Mutex;
 use std::{
-    alloc::{alloc_zeroed, dealloc, Layout},
+    alloc::{Layout, alloc_zeroed, dealloc},
     os::fd::AsRawFd,
     sync::{
         Arc,
@@ -182,9 +182,7 @@ fn initialize_kernel_check() -> bool {
                 None
             }
         })
-        .map_or(false, |(major, minor)| {
-            major > 6 || (major == 6 && minor >= 7)
-        });
+        .is_some_and(|(major, minor)| major > 6 || (major == 6 && minor >= 7));
 
     SUPPORTED.store(supported, Ordering::Release);
     INITIALIZED.store(true, Ordering::Release);
