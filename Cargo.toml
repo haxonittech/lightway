@@ -6,7 +6,6 @@ members = [
     "lightway-app-utils",
     "lightway-client",
     "lightway-server",
-    "test-iouring",
 ]
 
 resolver = "3"
