@@ -57,10 +57,12 @@ build:
         SET target = "riscv64gc-unknown-linux-gnu"
     END
 
-    DO lib-rust+CARGO --args="build --release --features io-uring --target=$target" --output="$target/release/lightway-(client|server)$"
+    DO lib-rust+CARGO --args="build --release --features io-uring --target=$target"
 
-    SAVE ARTIFACT ./target/$target/release/lightway-client AS LOCAL ./target/$target/release/
-    SAVE ARTIFACT ./target/$target/release/lightway-server AS LOCAL ./target/$target/release/
+    DO lib-rust+COPY_OUTPUT --output="$target/release/lightway-(client|server)$"
+    DO lib-rust+COPY_OUTPUT --output="$target/release/man/lightway-(client|server).1$"
+
+    SAVE ARTIFACT ./target/$target/release AS LOCAL ./target/$target/release
 
 # build-arm64 build for arm64. Support building from an amd64 or arm64 host
 build-arm64:
