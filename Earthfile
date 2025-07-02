@@ -62,6 +62,51 @@ build:
     SAVE ARTIFACT ./target/$target/release/lightway-client AS LOCAL ./target/$target/release/
     SAVE ARTIFACT ./target/$target/release/lightway-server AS LOCAL ./target/$target/release/
 
+rust-riscv:
+    FROM riscv64/ubuntu:questing
+    # FROM rust:1.87.0-$debian
+    RUN apt-get update
+    RUN apt-get install -y curl
+    RUN apt-get install -y make
+    RUN apt-get install -y patch
+
+    # Allow curl to set cert
+    # https://askubuntu.com/questions/1390288/curl-77-error-setting-certificate-verify-locations-ubuntu-20-04-3-lts
+    RUN apt install -y ca-certificates
+    RUN curl --proto '=https' --tlsv1.3 -sSf https://sh.rustup.rs | sh -s -- -y
+    ENV PATH="/root/.cargo/bin:${PATH}" # need this so that `rustup` can be used
+
+rust-test-base:
+    FROM +rust-riscv
+    RUN rustup target add x86_64-unknown-linux-gnu
+    RUN rustup target add riscv64gc-unknown-linux-gnu
+    RUN rustup target add aarch64-unknown-linux-gnu
+
+    WORKDIR /lightway
+    RUN apt-get update
+    RUN apt-get install -y --no-install-recommends \
+        autoconf \
+        autotools-dev \
+        bsdmainutils \
+        clang \
+        cmake \
+        libtool-bin \
+        shellcheck \ 
+        g++-riscv64-linux-gnu \ 
+        gcc-riscv64-linux-gnu
+
+rust-test:
+    FROM +rust-test-base
+    RUN rustup target add riscv64gc-unknown-linux-gnu
+
+    # copy src
+    COPY --keep-ts Cargo.toml Cargo.lock ./
+    COPY --keep-ts deny.toml ./
+    COPY --keep-ts --dir lightway-core lightway-app-utils lightway-client lightway-server .cargo ./
+
+    RUN false
+    RUN cargo check
+
 # build-arm64 build for arm64. Support building from an amd64 or arm64 host
 build-arm64:
     BUILD +build --ARCH="arm64"
