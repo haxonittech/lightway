@@ -10,7 +10,7 @@ readme = "README.md"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]
-default = []
+default = ["wolfssl/system_ca_certs"]
 debug = ["wolfssl/debug"]
 # Enable additional APIs to support wire protocol fuzzing
 fuzzing_api = []
