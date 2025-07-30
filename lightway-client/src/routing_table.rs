@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use route_manager::{AsyncRouteManager, Route, RouteManager};
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr};
@@ -135,37 +135,60 @@ impl RoutingTable {
 
     /// Adds Route
     async fn add_route(&mut self, route: &Route) -> Result<(), RoutingTableError> {
-        self.route_manager_async.add(route).await.map_err(|e| {
-            // Check if the error is related to permissions
-            if e.kind() == std::io::ErrorKind::PermissionDenied {
-                RoutingTableError::InsufficientPermissions
-            } else {
-                RoutingTableError::AddRouteError(e)
+        tracing::info!("Adding route: {} via {:?} (interface: {:?})", 
+            route.destination(), 
+            route.gateway(), 
+            route.if_index());
+        
+        match self.route_manager_async.add(route).await {
+            Ok(()) => {
+                tracing::info!("Successfully added route: {} via {:?}", 
+                    route.destination(), route.gateway());
+                Ok(())
             }
-        })
+            Err(e) => {
+                let error = if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    tracing::error!("Failed to add route due to insufficient permissions: {} via {:?} - {}", 
+                        route.destination(), route.gateway(), e);
+                    RoutingTableError::InsufficientPermissions
+                } else {
+                    tracing::error!("Failed to add route: {} via {:?} - {}", 
+                        route.destination(), route.gateway(), e);
+                    RoutingTableError::AddRouteError(e)
+                };
+                Err(error)
+            }
+        }
     }
 
     /// Adds Routes and stores it
     pub async fn add_route_vpn(&mut self, route: Route) -> Result<(), RoutingTableError> {
+        tracing::debug!("Adding VPN route: {}", route.destination());
         self.add_route(&route).await?;
         self.vpn_routes.push(route);
+        tracing::debug!("VPN route added successfully. Total VPN routes: {}", self.vpn_routes.len());
         Ok(())
     }
 
     /// Adds Server Route and stores it
     pub async fn add_route_server(&mut self, route: Route) -> Result<(), RoutingTableError> {
         if self.server_route.is_some() {
+            tracing::warn!("Attempted to add server route but one already exists");
             return Err(RoutingTableError::ServerRouteAlreadyExists);
         }
+        tracing::debug!("Adding server route: {}", route.destination());
         self.add_route(&route).await?;
         self.server_route = Some(route);
+        tracing::debug!("Server route added successfully");
         Ok(())
     }
 
     /// Adds LAN Route and stores it
     pub async fn add_route_lan(&mut self, route: Route) -> Result<(), RoutingTableError> {
+        tracing::debug!("Adding LAN route: {}", route.destination());
         self.add_route(&route).await?;
         self.lan_routes.push(route);
+        tracing::debug!("LAN route added successfully. Total LAN routes: {}", self.lan_routes.len());
         Ok(())
     }
 
@@ -192,13 +215,20 @@ impl RoutingTable {
         interface_index: u32,
         gateway: IpAddr,
     ) -> Result<(), RoutingTableError> {
+        tracing::debug!("Adding {} standard tunnel routes via gateway {} on interface {}", 
+            TUNNEL_ROUTES.len(), gateway, interface_index);
+        
         for (network, prefix) in TUNNEL_ROUTES {
             let tunnel_route = Route::new(network, prefix)
                 .with_gateway(gateway)
                 .with_if_index(interface_index);
 
+            tracing::debug!("Adding tunnel route: {}/{} via {} on interface {}", 
+                network, prefix, gateway, interface_index);
             self.add_route_vpn(tunnel_route).await?;
         }
+        
+        tracing::info!("Successfully added all {} tunnel routes", TUNNEL_ROUTES.len());
         Ok(())
     }
 
@@ -241,6 +271,7 @@ impl RoutingTable {
 
     /// Clean up for program unwind
     pub fn cleanup_sync(&mut self) {
+        tracing::info!("route_table cleanup called!");
         for route in &self.vpn_routes {
             if let Err(e) = self.route_manager.delete(route) {
                 warn!(
@@ -275,39 +306,65 @@ impl RoutingTable {
         tun_peer_ip: &IpAddr,
         tun_dns_ip: &IpAddr,
     ) -> Result<()> {
+        tracing::info!("Initializing routing table with mode: {:?}", self.routing_mode);
+        tracing::info!("Server IP: {}, TUN index: {}, TUN peer: {}, TUN DNS: {}", 
+            server_ip, tun_index, tun_peer_ip, tun_dns_ip);
+        
         if self.routing_mode == RouteMode::NoExec {
+            tracing::info!("Route mode is NoExec, skipping routing table setup");
             return Ok(());
         }
 
         // Setting up VPN Server Routes
+        tracing::debug!("Finding default interface and gateway for server IP: {}", server_ip);
         let (default_interface_index, default_interface_gateway) =
             self.find_default_interface_index_and_gateway(server_ip)?;
+        
+        tracing::info!("Default interface index: {}, gateway: {:?}", 
+            default_interface_index, default_interface_gateway);
 
         // Create server route with optional gateway - handles both direct routes (containers)
         // and routed networks (host systems with gateways)
         let server_route = Route::new(*server_ip, 32).with_if_index(default_interface_index);
         let server_route = match default_interface_gateway {
-            Some(gateway) => server_route.with_gateway(gateway),
-            None => server_route,
+            Some(gateway) => {
+                tracing::debug!("Creating server route with gateway: {}", gateway);
+                server_route.with_gateway(gateway)
+            }
+            None => {
+                tracing::debug!("Creating direct server route (no gateway)");
+                server_route
+            }
         };
 
+        tracing::info!("Adding server route for: {}", server_ip);
         self.add_route_server(server_route).await?;
 
         if self.routing_mode == RouteMode::Lan {
+            tracing::info!("Adding standard LAN routes for RouteMode::Lan");
             self.add_standard_lan_routes(default_interface_index, default_interface_gateway)
                 .await?;
         }
 
         // Add standard tunnel routes (high priority default routing)
+        tracing::info!("Adding standard tunnel routes (0/1 and 128/1)");
         self.add_standard_tunnel_routes(tun_index, *tun_peer_ip)
             .await?;
 
         // Add DNS route separately since it's not a constant
+        tracing::info!("Adding DNS route for: {}", tun_dns_ip);
         let dns_route = Route::new(*tun_dns_ip, 32)
             .with_gateway(*tun_peer_ip)
             .with_if_index(tun_index);
 
         self.add_route_vpn(dns_route).await?;
+        
+        tracing::info!("Routing table initialization completed successfully");
+        tracing::info!("Total routes added - VPN: {}, LAN: {}, Server: {}", 
+            self.vpn_routes.len(), 
+            self.lan_routes.len(), 
+            if self.server_route.is_some() { 1 } else { 0 });
+        
         Ok(())
     }
 }

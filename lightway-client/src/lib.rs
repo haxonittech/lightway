@@ -286,7 +286,25 @@ async fn handle_events<A: 'static + Send + EventCallback>(
     enable_encoding_when_online: bool,
     event_handler: Option<A>,
     inside_io: Arc<dyn InsideIOSendCallback<ConnectionState> + Send + Sync>,
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "openbsd",
+        target_os = "windows"
+    ))]
+    mut routing_config: Option<(RoutingTable, std::net::IpAddr, u32, std::net::Ipv4Addr, std::net::Ipv4Addr)>,
 ) {
+    let mut routing_initialized = false;
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "openbsd",
+        target_os = "windows"
+    ))]
+    let mut route_table_keeper: Option<RoutingTable> = None;
+    
     while let Some(event) = stream.next().await {
         match &event {
             Event::StateChanged(state) => {
@@ -297,6 +315,34 @@ async fn handle_events<A: 'static + Send + EventCallback>(
                     };
 
                     conn.lock().unwrap().inside_io(inside_io.clone());
+
+                    // Set up routing only once when connection goes online
+                    #[cfg(any(
+                        target_os = "freebsd",
+                        target_os = "linux",
+                        target_os = "macos",
+                        target_os = "openbsd",
+                        target_os = "windows"
+                    ))]
+                    if !routing_initialized {
+                        if let Some((mut route_table, server_ip, tun_index, tun_peer_ip, tun_dns_ip)) = routing_config.take() {
+                            println!("DTLS connection established, setting up routing table...");
+                            std::thread::sleep(Duration::from_secs(3));
+                            if let Err(e) = route_table.initialize_routing_table(
+                                &server_ip,
+                                tun_index,
+                                &tun_peer_ip.into(),
+                                &tun_dns_ip.into(),
+                            ).await {
+                                tracing::error!("Failed to initialize routing table: {}", e);
+                            } else {
+                                println!("Route table setup complete!");
+                                routing_initialized = true;
+                                // Keep the route_table alive to prevent cleanup
+                                route_table_keeper = Some(route_table);
+                            }
+                        }
+                    }
 
                     if enable_encoding_when_online {
                         if let Err(e) = conn.lock().unwrap().set_encoding(true) {
@@ -408,6 +454,7 @@ pub async fn inside_io_task<T: Send + Sync>(
             }
             Err(err) => {
                 // Fatal error
+                tracing::warn!("WolfSSL might behere");
                 return Err(err.into());
             }
         }
@@ -609,30 +656,6 @@ pub async fn client<A: 'static + Send + EventCallback, T: Send + Sync>(
     };
 
     let tun_index: u32 = inside_io.if_index()?.try_into()?;
-    #[cfg(any(
-        target_os = "freebsd",
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "openbsd",
-        target_os = "windows"
-    ))]
-    let mut route_table = RoutingTable::new(config.route_mode)?;
-    #[cfg(any(
-        target_os = "freebsd",
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "openbsd",
-        target_os = "windows"
-    ))]
-    route_table
-        .initialize_routing_table(
-            &config.server.ip(),
-            tun_index,
-            &config.tun_peer_ip.into(),
-            &config.tun_dns_ip.into(),
-        )
-        .await?;
-
     let (event_cb, event_stream) = EventStreamCallback::new();
 
     let has_inside_pkt_codec = config.inside_pkt_codec.is_some();
@@ -720,6 +743,22 @@ pub async fn client<A: 'static + Send + EventCallback, T: Send + Sync>(
     let event_handler = config.event_handler.take();
     let event_inside_io: InsideIOSendCallbackArg<ConnectionState> =
         inside_io.clone().into_io_send_callback();
+    
+    // Prepare routing configuration for event handler
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "openbsd",
+        target_os = "windows"
+    ))]
+    let routing_config = if !matches!(config.route_mode, RouteMode::NoExec) {
+        let route_table = RoutingTable::new(config.route_mode)?;
+        Some((route_table, config.server.ip(), tun_index, config.tun_peer_ip, config.tun_dns_ip))
+    } else {
+        None
+    };
+    
     join_set.spawn(handle_events(
         event_stream,
         keepalive.clone(),
@@ -730,6 +769,14 @@ pub async fn client<A: 'static + Send + EventCallback, T: Send + Sync>(
             .is_some_and(|x| x.enable_encoding_at_connect),
         event_handler,
         event_inside_io,
+        #[cfg(any(
+            target_os = "freebsd",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "openbsd",
+            target_os = "windows"
+        ))]
+        routing_config,
     ));
 
     ticker_task.spawn_in(Arc::downgrade(&conn), &mut join_set);
@@ -746,7 +793,34 @@ pub async fn client<A: 'static + Send + EventCallback, T: Send + Sync>(
         outside_io,
         keepalive.clone(),
     ));
+    println!("outside_io_loop spawn");
 
+
+    // std::thread::sleep(Duration::from_secs(1));
+    // #[cfg(any(
+    //     target_os = "freebsd",
+    //     target_os = "linux",
+    //     target_os = "macos",
+    //     target_os = "openbsd",
+    //     target_os = "windows"
+    // ))]
+    // let mut route_table = RoutingTable::new(config.route_mode)?;
+    // #[cfg(any(
+    //     target_os = "freebsd",
+    //     target_os = "linux",
+    //     target_os = "macos",
+    //     target_os = "openbsd",
+    //     target_os = "windows"
+    // ))]
+    // route_table
+    //     .initialize_routing_table(
+    //         &config.server.ip(),
+    //         tun_index,
+    //         &config.tun_peer_ip.into(),
+    //         &config.tun_dns_ip.into(),
+    //     )
+    //     .await?;
+    // println!("Route table setup!");
     let inside_io_loop: JoinHandle<anyhow::Result<()>> =
         tokio::spawn(inside_io_task(conn.clone(), inside_io, config.tun_dns_ip));
 
