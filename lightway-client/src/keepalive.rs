@@ -212,8 +212,17 @@ async fn keepalive<CONFIG: SleepManager, CONNECTION: Connection>(
                         // the keepalives otherwise this will
                         // reset our timeouts
                         tracing::info!("network change keepalives");
-                        state = State::Waiting;
-                        timeout.as_mut().set(None.into())
+                        if let Err(e) = conn.keepalive() {
+                            tracing::error!("Send Keepalive failed: {e:?}");
+                        }
+                        if !config.timeout_is_zero() {
+                            state = State::Pending;
+                            let fut = config.sleep_for_timeout();
+                            timeout.as_mut().set(Some(fut).into());
+                        } else {
+                            state = State::Waiting;
+                            timeout.as_mut().set(None.into());
+                        }
                     },
                     Message::Suspend => {
                         // Suspend keepalives whenever the timer is active
