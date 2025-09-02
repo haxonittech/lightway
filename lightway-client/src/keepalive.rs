@@ -286,6 +286,7 @@ mod tests {
         pending_interval: Option<oneshot::Sender<()>>,
         pending_timeout: Option<oneshot::Sender<()>>,
         continuous: bool,
+        timeout_called: bool,
     }
 
     impl FixtureState {
@@ -301,16 +302,19 @@ mod tests {
             // Most events just expect the interval timer to be
             // created (since it is recreated on every loop).
             //
-            // `TimeoutExpired` must follow `IntervalExpired` and in
-            // this case both timers are primed, the timeout while
-            // handling interval expiration and then interval again on
+            // `TimeoutExpired` normally expects 2 sleeps when it follows
+            // `IntervalExpired` because both timers are primed: the timeout
+            // while handling interval expiration and then interval again on
             // the next iteration of the loop.
             //
-            // Note that `tokio::select` always executes the
-            // expression of each branch, even if the guard condition
-            // is false (it just never polls the resulting future in
-            // that case). This is why one timer is expected even for
-            // `Online`.
+            // However, with the new NetworkChange behavior, NetworkChange
+            // directly triggers `sleep_for_timeout()` and sets up the timeout
+            // timer immediately. When this happens, `TimeoutExpired` only
+            // expects 1 sleep because the timeout was already triggered by
+            // NetworkChange, not by the interval mechanism.
+            //
+            // We must ensure that TimeoutExpired events only complete after
+            // sleep_for_timeout has actually been called.
             let required_sleeps = if matches!(ev, FixtureEvent::TimeoutExpired) {
                 2
             } else {
@@ -320,6 +324,21 @@ mod tests {
             assert_lt!(self.sleep_requests, required_sleeps);
 
             self.sleep_requests += 1;
+
+            // For TimeoutExpired events, we must wait for sleep_for_timeout to be called
+            if matches!(ev, FixtureEvent::TimeoutExpired) {
+                if self.timeout_called && self.sleep_requests > 1 {
+                    println!("ev {ev:?} is complete (timed out)");
+                    self.timeout_called = false; // Reset for next event
+                    self.sleep_requests = 0;
+                    self.events.pop_front();
+                    self.done.send(()).unwrap();
+                    return;
+                } else {
+                    println!("ev {ev:?} waiting for sleep_for_timeout to be called");
+                    return;
+                }
+            }
 
             if self.sleep_requests == required_sleeps {
                 println!("ev {ev:?} is complete");
@@ -351,6 +370,7 @@ mod tests {
                     pending_interval: None,
                     pending_timeout: None,
                     continuous,
+                    timeout_called: false,
                 })),
                 Arc::new(TokioMutex::new(rx)),
             )
@@ -435,6 +455,7 @@ mod tests {
             println!("sleep_for_timeout");
             let mut inner = self.0.lock().unwrap();
 
+            inner.timeout_called = true;
             inner.sleep_event();
 
             let (tx, rx) = oneshot::channel();
@@ -473,6 +494,24 @@ mod tests {
         assert_eq!(0, fixture.keepalive_count());
     }
 
+    #[test_case(true; "Continuous mode")]
+    #[test_case(false; "Non-Continuous mode")]
+    #[tokio::test]
+    async fn keepalives_are_sent_immediately_network_change(continuous: bool) {
+        use FixtureEvent::*;
+        let fixture = Fixture::new(vec![NetworkChange, Wait], continuous);
+
+        let (keepalive, task) = fixture.run().await;
+
+        drop(keepalive);
+        assert!(matches!(
+            task.await.unwrap(),
+            Ok(KeepaliveResult::Cancelled)
+        ));
+
+        assert_eq!(1, fixture.keepalive_count());
+    }
+
     #[test_case(true; "Continuous uses Online to start keepalives")]
     #[test_case(false; "Non-Continuous uses NetworkChange to start keepalives")]
     #[tokio::test]
@@ -489,7 +528,8 @@ mod tests {
             Ok(KeepaliveResult::Cancelled)
         ));
 
-        assert_eq!(1, fixture.keepalive_count());
+        let expected_count = if continuous { 1 } else { 2 };
+        assert_eq!(expected_count, fixture.keepalive_count());
     }
 
     #[test_case(true; "Continuous uses Online to start keepalives")]
@@ -517,7 +557,8 @@ mod tests {
             Ok(KeepaliveResult::Cancelled)
         ));
 
-        assert_eq!(3, fixture.keepalive_count());
+        let expected_count = if continuous { 3 } else { 4 };
+        assert_eq!(expected_count, fixture.keepalive_count());
     }
 
     #[tokio::test]
@@ -574,7 +615,8 @@ mod tests {
             Ok(KeepaliveResult::Cancelled)
         ));
 
-        assert_eq!(3, fixture.keepalive_count());
+        let expected_count = if continuous { 3 } else { 4 };
+        assert_eq!(expected_count, fixture.keepalive_count());
     }
 
     #[test_case(true; "Continuous uses Online to start keepalives")]
@@ -592,7 +634,8 @@ mod tests {
 
         assert!(matches!(task.await.unwrap(), Ok(KeepaliveResult::Timedout)));
 
-        assert_eq!(1, fixture.keepalive_count());
+        let expected_count = if continuous { 1 } else { 2 };
+        assert_eq!(expected_count, fixture.keepalive_count());
     }
 
     #[test_case(true; "Continuous uses Online to start keepalives")]
@@ -615,7 +658,8 @@ mod tests {
 
         assert!(matches!(task.await.unwrap(), Ok(KeepaliveResult::Timedout)));
 
-        assert_eq!(1, fixture.keepalive_count());
+        let expected_count = if continuous { 1 } else { 2 };
+        assert_eq!(expected_count, fixture.keepalive_count());
     }
 
     #[test_case(true; "Continuous uses Online to start keepalives")]
@@ -644,6 +688,7 @@ mod tests {
             Ok(KeepaliveResult::Cancelled)
         ));
 
-        assert_eq!(2, fixture.keepalive_count());
+        let expected_count = if continuous { 2 } else { 4 };
+        assert_eq!(expected_count, fixture.keepalive_count());
     }
 }
