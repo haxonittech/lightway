@@ -19,8 +19,14 @@ struct EventHandler;
 
 impl EventCallback for EventHandler {
     fn event(&mut self, event: lightway_core::Event) {
-        if let Event::StateChanged(state) = event {
-            tracing::debug!("State changed to {:?}", state);
+        match event {
+            Event::StateChanged(state) => {
+                tracing::debug!("State changed to {:?}", state);
+            }
+            Event::EncodingStateChanged { enabled } => {
+                tracing::debug!("Encoding state changed to {:?}", enabled);
+            }
+            _ => {}
         }
     }
 }

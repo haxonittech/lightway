@@ -324,6 +324,9 @@ async fn handle_events<A: 'static + Send + EventCallback, ExtAppState: Send + Sy
             Event::FirstPacketReceived => {
                 info!("First outside packet received");
             }
+            Event::EncodingStateChanged { enabled } => {
+                info!("Encoding state changed to {enabled}");
+            }
 
             // Server only events
             Event::SessionIdRotationAcknowledged { .. }

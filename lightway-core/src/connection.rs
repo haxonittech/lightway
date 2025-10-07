@@ -1640,6 +1640,8 @@ impl<AppState: Send> Connection<AppState> {
             encoder.get_encoding_state()
         );
 
+        self.event(Event::EncodingStateChanged { enabled: er.enable });
+
         // Reply to the client.
         let msg = wire::Frame::EncodingResponse(wire::EncodingResponse {
             id: er.id,
@@ -1695,6 +1697,10 @@ impl<AppState: Send> Connection<AppState> {
 
         encoder.set_encoding_state(new_setting);
         info!("inside packet encoding state is now set to {}", new_setting);
+
+        self.event(Event::EncodingStateChanged {
+            enabled: new_setting,
+        });
 
         // Removes from pending pkt store such that it is no longer retransmitted
         self.encoding_request_states.pending_request_pkt = None;

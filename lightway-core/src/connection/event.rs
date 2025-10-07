@@ -30,4 +30,12 @@ pub enum Event {
     ///
     /// Client connections only
     FirstPacketReceived,
+    /// The inside packet codec encoding state has changed
+    ///
+    /// Fired when the server agrees to enable or disable the inside packet codec
+    /// after the client requests it, or when the server enables/disables it.
+    EncodingStateChanged {
+        /// Whether encoding is now enabled
+        enabled: bool,
+    },
 }
