@@ -60,10 +60,6 @@
                 buildInputs = runtimeDeps;
                 nativeBuildInputs = buildDeps;
                 cargoBuildFlags = "-p ${package}";
-                checkFlags = [
-                  # These tests need permission to create tun interface
-                  "--skip=route_manager::tests"
-                ];
                 # Enable ARM crypto extensions, overrides the default stdenv.hostPlatform.gcc.arch.
                 env.NIX_CFLAGS_COMPILE =
                   with pkgs.stdenv.hostPlatform;
