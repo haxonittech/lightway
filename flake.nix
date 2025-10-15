@@ -64,6 +64,10 @@
                   # These tests need permission to create tun interface
                   "--skip=route_manager::tests"
                 ];
+                # Enable ARM crypto extensions, overrides the default stdenv.hostPlatform.gcc.arch.
+                env.NIX_CFLAGS_COMPILE =
+                  with pkgs.stdenv.hostPlatform;
+                  lib.optionalString (isAarch && isLinux) "-march=${gcc.arch}+crypto";
                 cargoLock.outputHashes = {
                   "wolfssl-3.0.0" = "sha256-9jAA5AoEEtKVD8aJw5B2ULf8R3jN2MGdIyxFbvJfVu8=";
                 };
@@ -94,7 +98,6 @@
           packages.lightway-server = rustPackage "latest" "lightway-server" serverFeatures;
           packages.lightway-client-msrv = rustPackage msrv "lightway-client" clientFeatures;
           packages.lightway-server-msrv = rustPackage msrv "lightway-server" serverFeatures;
-
 
           devShells.stable = mkDevShell pkgs.rust-bin.stable.latest.default;
           devShells.nightly = mkDevShell pkgs.rust-bin.nightly.latest.default;
