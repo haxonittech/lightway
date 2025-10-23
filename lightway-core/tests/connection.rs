@@ -465,6 +465,9 @@ async fn client<S: TestSock>(
                     println!("First packet received");
                     is_first_packet_received = true;
                 }
+                Event::EncodingStateChanged { enabled } => {
+                    println!("Encoding state change to {enabled}")
+                }
             }
         }
     });

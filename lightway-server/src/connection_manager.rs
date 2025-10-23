@@ -160,6 +160,7 @@ async fn handle_events(mut stream: EventStream, conn: Weak<Connection>) {
             Event::FirstPacketReceived => {
                 unreachable!("client only event received");
             }
+            Event::EncodingStateChanged { .. } => {}
         }
     }
 }
